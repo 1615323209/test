@@ -1,0 +1,21 @@
+# API keys (contains real credentials)
+.env
+
+# Runtime data (caches, checkpoints, output)
+data/
+
+# Python build artifacts
+novel_decomp.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.egg-info/
+
+# Novel source files (用户私有)
+*.txt
+
+# IDE
+.vscode/
+.idea/

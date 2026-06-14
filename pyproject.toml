@@ -1,0 +1,34 @@
+[project]
+name = "novel-decomp"
+version = "0.1.0"
+description = "AI-powered web novel decomposition: extract outlines, characters, factions, locations, and power systems"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "pydantic>=2.0.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "httpx>=0.28.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+novel-decomp = "novel_decomp.scripts.cli:app"
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = [
+    "novel_decomp",
+    "novel_decomp.models",
+    "novel_decomp.cache",
+    "novel_decomp.layer1",
+    "novel_decomp.layer2",
+    "novel_decomp.layer3",
+    "novel_decomp.layer4",
+    "novel_decomp.export",
+    "novel_decomp.pipeline",
+    "novel_decomp.scripts",
+]
