@@ -81,10 +81,9 @@ def collate_batch_results(
                 pov_character=ch.get("pov_character", ""),
                 locations_visited=ch.get("locations_visited", []),
                 characters_appeared=ch.get("characters_appeared", []),
-                reveals=ch.get("reveals", []),
-                timeline_hint=ch.get("timeline_hint", ""),
-                emotional_tone=ch.get("emotional_tone", ""),
-                plot_tags=ch.get("plot_tags", []),
+                character_relationships=ch.get("character_relationships", []),
+                foreshadowing_planted=ch.get("foreshadowing_planted", []),
+                foreshadowing_resolved=ch.get("foreshadowing_resolved", []),
             ))
 
         # Collect entity updates
@@ -106,6 +105,20 @@ def collate_batch_results(
     # Sort chapters by number
     all_chapters.sort(key=lambda c: c.chapter_number)
 
+    # Build per-location chapter presence from all chapters
+    from collections import defaultdict
+    location_chapters: dict[str, list[int]] = defaultdict(list)
+    for ch in all_chapters:
+        for loc_name in ch.locations_visited:
+            location_chapters[loc_name].append(ch.chapter_number)
+
+    # Also count character appearances for the resolver
+    char_chapters: dict[str, list[int]] = defaultdict(list)
+    for ch in all_chapters:
+        for c in ch.characters_appeared:
+            name = c.get("名称", c.get("name", str(c))) if isinstance(c, dict) else str(c)
+            char_chapters[name].append(ch.chapter_number)
+
     return {
         "chapters": all_chapters,
         "raw_characters": raw_characters,
@@ -117,4 +130,6 @@ def collate_batch_results(
         "narrative_summaries": narrative_summaries,
         "batch_count": len(batch_files),
         "total_chapter_summaries": len(all_chapters),
+        "location_chapters": dict(location_chapters),
+        "char_chapters": dict(char_chapters),
     }

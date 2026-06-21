@@ -37,7 +37,7 @@ def build_full_outline(
     arc_boundaries = _extract_arc_boundaries(narrative_summaries, total)
 
     # Segment into volumes
-    volumes = _segment_volumes(chapters, arc_boundaries, volume_size)
+    volumes = _segment_volumes(chapters, arc_boundaries, volume_size, narrative_summaries)
 
     # Build chapter-level outline
     chapter_outline = []
@@ -51,8 +51,6 @@ def build_full_outline(
                 {"type": ev.type, "description": ev.description}
                 for ev in ch.key_events[:3]  # Top 3 events
             ],
-            "tone": ch.emotional_tone,
-            "tags": ch.plot_tags,
             "locations": ch.locations_visited,
             "characters": ch.characters_appeared[:5],  # Top 5 characters
         })
@@ -96,6 +94,7 @@ def _segment_volumes(
     chapters: list[ChapterSummary],
     boundaries: set[int],
     default_size: int = 100,
+    narrative_summaries: list[dict] | None = None,
 ) -> list[dict]:
     """Segment chapters into volumes based on arc boundaries or chapter count.
 
@@ -141,19 +140,27 @@ def _segment_volumes(
                     "key_developments": [],
                 })
 
-    # Fill in volume summaries from actual chapter content
+    # Fill in volume summaries from chapter content AND narrative summaries
     for vol in volumes:
         start = vol["chapter_range"][0]
         end = vol["chapter_range"][1]
         vol_chapters = [c for c in chapters if start <= c.chapter_number <= end]
 
         if vol_chapters:
-            # Collate key developments
+            # Collate key developments from per-chapter major events
             devs = set()
             for ch in vol_chapters:
-                for ev in ch.key_events[:1]:  # Top event per chapter
+                for ev in ch.key_events[:1]:
                     if ev.significance == "major":
                         devs.add(ev.description)
+            # Also pull from narrative summaries that overlap this volume
+            for ns in (narrative_summaries or []):
+                ns_range = ns.get("chapter_range", [])
+                if ns_range and len(ns_range) == 2:
+                    ns_start, ns_end = ns_range
+                    if ns_start <= end and ns_end >= start:  # overlaps
+                        for dev in ns.get("major_developments", []):
+                            devs.add(dev)
             vol["key_developments"] = list(devs)[:10]
 
             # Generate volume summary from first/last chapters

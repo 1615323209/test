@@ -124,7 +124,7 @@ class AnthropicClient:
         tool_schema: dict,
         *,
         model: str = "",
-        max_tokens: int = 16384,
+        max_tokens: int = 32768,
         temperature: float = 0.3,
         layer: int = 0,
         batch_id: int = 0,

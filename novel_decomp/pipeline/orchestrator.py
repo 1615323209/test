@@ -58,6 +58,9 @@ async def run_full_pipeline(
     cache = DiskCache(DATA_DIR / "cache", enabled=True)
     client = create_client(cache=cache, model=model)
 
+    # Save novel path so resume works
+    checkpoint_mgr.save({"novel_path": str(novel_path), "layers": {}, "current_layer": 1})
+
     start_time = datetime.now()
 
     # ═════ Layer 1: Preprocessing ═════
@@ -134,7 +137,11 @@ async def run_full_pipeline(
           f"{len(raw_data['raw_powers'])} powers")
 
     # Resolve
-    resolved = resolve_entities(raw_data)
+    resolved = resolve_entities(
+        raw_data,
+        location_chapters=raw_data.get("location_chapters"),
+        char_chapters=raw_data.get("char_chapters"),
+    )
     stats = resolved.pop("resolution_stats", {})
     for etype, estats in stats.items():
         print(f"  ✓ {etype}: {estats['raw_count']} raw → "
@@ -147,6 +154,7 @@ async def run_full_pipeline(
         raw_data.get("all_contradictions", []),
         raw_characters=raw_data.get("raw_characters", []),
         raw_factions=raw_data.get("raw_factions", []),
+        all_narrative_summaries=raw_data.get("narrative_summaries", []),
     )
     gaps = detect_gaps(resolved.get("characters", {}))
     print(f"  ✓ Detected {len(retcons)} retcons, {len(gaps)} character gaps")
@@ -208,7 +216,10 @@ async def run_full_pipeline(
     print(f"  ✓ Built outline: {len(outline['volumes'])} volumes")
 
     # Build character evolution from raw batch data
-    evolutions = build_character_evolution(raw_data.get("raw_characters", []))
+    evolutions = build_character_evolution(
+        raw_data.get("raw_characters", []),
+        resolved_factions=resolved.get("factions", {}),
+    )
     chars_with_evo = sum(1 for e in evolutions.values()
                          if len(e.get("personality_stages", [])) >= 2
                          or len(e.get("power_stages", [])) >= 1
@@ -218,9 +229,13 @@ async def run_full_pipeline(
     # Build profiles
     char_profiles = build_character_profiles(
         resolved.get("characters", {}),
+        factions=resolved.get("factions", {}),
         evolutions=evolutions,
     )
-    faction_profiles = build_faction_profiles(resolved.get("factions", {}))
+    faction_profiles = build_faction_profiles(
+        resolved.get("factions", {}),
+        characters=resolved.get("characters", {}),
+    )
     location_profiles = build_location_profiles(resolved.get("locations", {}))
     power_profiles = build_power_profiles(resolved.get("powers", {}))
     print(f"  ✓ Built profiles: {len(char_profiles)} characters, "
@@ -232,11 +247,14 @@ async def run_full_pipeline(
     plot_arcs = synthesize_plot_arcs(
         raw_data["chapters"],
         raw_data["narrative_summaries"],
+        resolved_characters=resolved.get("characters", {}),
+        resolved_locations=resolved.get("locations", {}),
     )
     print(f"  ✓ Synthesized {len(plot_arcs)} plot arcs")
 
     # Save Layer 4 output
     layer4_output = {
+        "synopsis": novel_metadata.get("synopsis", ""),
         "outline": outline,
         "character_profiles": char_profiles,
         "faction_profiles": faction_profiles,
@@ -267,6 +285,7 @@ async def run_full_pipeline(
         output_dir / "reports",
         novel_title=novel_metadata.get("title", ""),
         author=novel_metadata.get("author", ""),
+        layer2_dir=output_dir / "layer2",
     )
     for f in md_files:
         print(f"  ✓ {f.name}")
@@ -316,18 +335,12 @@ async def resume_pipeline(
     novel_path: str = "",
     model: str = "",
 ) -> dict:
-    """Resume pipeline from last checkpoint.
+    """Resume pipeline from last checkpoint — skips completed layers.
 
-    Args:
-        checkpoint_dir: Directory with checkpoint state.
-        output_dir: Output directory.
-        novel_path: Override novel path (if moved).
-        model: Override model.
-
-    Returns:
-        Pipeline results summary.
+    Imports are at function level to avoid circular dependencies.
     """
     checkpoint_dir = Path(checkpoint_dir)
+    output_dir = Path(output_dir)
     checkpoint_mgr = CheckpointManager(checkpoint_dir)
     state = checkpoint_mgr.load()
 
@@ -338,17 +351,208 @@ async def resume_pipeline(
     if not np_path:
         raise ValueError("Novel path not found in checkpoint — provide --novel")
 
-    current_layer = state.get("current_layer", 1)
-    print(f"Resuming from Layer {current_layer}...")
+    model = model or DEFAULT_MODEL
+    layers = state.get("layers", {})
 
-    # TODO: Implement selective resume per layer
-    # For now, re-run from the failed layer
-    return await run_full_pipeline(
-        novel_path=np_path,
-        output_dir=output_dir,
-        checkpoint_dir=checkpoint_dir,
-        model=model or DEFAULT_MODEL,
+    # Pre-import all modules that may be needed (avoid UnboundLocalError)
+    from novel_decomp.layer3.collator import collate_batch_results
+    from novel_decomp.layer3.resolver import resolve_entities, find_ambiguous_merges
+    from novel_decomp.layer3.detector import detect_retcons, detect_gaps, summarize_entity_db
+    from novel_decomp.layer4.outline import build_full_outline
+    from novel_decomp.layer4.profiles import (
+        build_character_profiles, build_faction_profiles,
+        build_location_profiles, build_power_profiles, build_character_evolution,
     )
+    from novel_decomp.layer4.arcs import synthesize_plot_arcs
+    from novel_decomp.export.markdown import export_all
+    from novel_decomp.export.sampling import export_human_review_sample
+
+    def _is_done(layer: int) -> bool:
+        return layers.get(str(layer), {}).get("status") == "completed"
+
+    cache = DiskCache(DATA_DIR / "cache", enabled=True)
+    client = create_client(cache=cache, model=model)
+    start_time = datetime.now()
+
+    # ── Layer 1: always fast, run if not done ──
+    chapters = extract_chapters(np_path)
+    batches = build_batches(chapters, target_chapters_per_batch=DEFAULT_BATCH_SIZE)
+    novel_metadata = _extract_metadata(Path(np_path), chapters)
+
+    if not _is_done(1):
+        print("\n" + "=" * 60)
+        print("  Layer 1: Preprocessing")
+        print("=" * 60)
+        checkpoint_mgr.update_layer_state(1, status="running")
+        print(f"  ✓ Extracted {len(chapters)} chapters")
+        stats = get_batch_stats(batches)
+        print(f"  ✓ Built {stats['total_batches']} batches "
+              f"(avg {stats['avg_chapters_per_batch']:.1f} chapters)")
+        checkpoint_mgr.update_layer_state(1, status="completed", batches_completed=1, total_batches=1)
+    else:
+        print(f"  Layer 1: skipped (completed)")
+
+    # ── Layer 2: skip if done, else run ──
+    layer2_output_dir = output_dir / "layer2"
+    if _is_done(2) and _layer2_files_exist(layer2_output_dir):
+        print(f"  Layer 2: skipped (completed, {len(list(layer2_output_dir.glob('batch_*.json')))} batch files)")
+    else:
+        print("\n" + "=" * 60)
+        print("  Layer 2: Chapter Analysis (Rolling Context)")
+        print("=" * 60)
+        checkpoint_mgr.update_layer_state(2, status="running", total_batches=len(batches))
+        from novel_decomp.layer2.runner import Layer2Runner
+        runner = Layer2Runner(
+            client=client,
+            novel_metadata=novel_metadata,
+            output_dir=layer2_output_dir,
+            checkpoint_dir=checkpoint_dir,
+            model=model,
+        )
+        try:
+            await runner.run(batches)
+            print(f"  ✓ Layer 2 complete")
+            checkpoint_mgr.update_layer_state(2, status="completed", batches_completed=len(batches))
+        except Exception as e:
+            print(f"  ✗ Layer 2 failed: {e}")
+            checkpoint_mgr.update_layer_state(2, status="failed", error=str(e))
+            raise
+
+    # ── Layer 3: skip if done, else aggregate ──
+    if _is_done(3) and (output_dir / "layer3_resolved.json").exists():
+        print(f"  Layer 3: skipped (completed)")
+        l3_data = json.loads((output_dir / "layer3_resolved.json").read_text(encoding="utf-8"))
+    else:
+        print("\n" + "=" * 60)
+        print("  Layer 3: Aggregation & Entity Resolution")
+        print("=" * 60)
+        checkpoint_mgr.update_layer_state(3, status="running")
+
+        raw_data = collate_batch_results(layer2_output_dir)
+        resolved = resolve_entities(
+            raw_data,
+            location_chapters=raw_data.get("location_chapters"),
+            char_chapters=raw_data.get("char_chapters"),
+        )
+        stats = resolved.pop("resolution_stats", {})
+        for etype, estats in stats.items():
+            print(f"  ✓ {etype}: {estats['raw_count']} raw → {estats['resolved_count']} resolved ({estats['merges']} merges)")
+
+        retcons = detect_retcons(
+            resolved.get("characters", {}), resolved.get("factions", {}),
+            raw_data.get("all_contradictions", []),
+            raw_characters=raw_data.get("raw_characters", []),
+            raw_factions=raw_data.get("raw_factions", []),
+            all_narrative_summaries=raw_data.get("narrative_summaries", []),
+        )
+        gaps = detect_gaps(resolved.get("characters", {}))
+        ambiguous = find_ambiguous_merges(resolved.get("characters", {}))
+        entity_summary = summarize_entity_db(resolved)
+
+        l3_data = {
+            "resolved_entities": {
+                "characters": resolved.get("characters", {}),
+                "factions": resolved.get("factions", {}),
+                "locations": resolved.get("locations", {}),
+                "powers": resolved.get("powers", {}),
+            },
+            "retcons": retcons, "gaps": gaps,
+            "ambiguous_merges": ambiguous, "stats": entity_summary,
+            "resolution_stats": stats,
+        }
+        (output_dir / "layer3_resolved.json").write_text(
+            json.dumps(l3_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"  ✓ Layer 3 complete")
+        checkpoint_mgr.update_layer_state(3, status="completed", batches_completed=1, total_batches=1)
+
+    # ── Layer 4: skip if done, else synthesize ──
+    if _is_done(4) and (output_dir / "layer4_synthesis.json").exists():
+        print(f"  Layer 4: skipped (completed)")
+        l4_data = json.loads((output_dir / "layer4_synthesis.json").read_text(encoding="utf-8"))
+    else:
+        print("\n" + "=" * 60)
+        print("  Layer 4: Global Synthesis")
+        print("=" * 60)
+        checkpoint_mgr.update_layer_state(4, status="running")
+
+        raw_data = collate_batch_results(layer2_output_dir)
+        resolved = l3_data["resolved_entities"]
+        outline = build_full_outline(raw_data["chapters"], raw_data["narrative_summaries"])
+        evolutions = build_character_evolution(
+            raw_data.get("raw_characters", []),
+            resolved_factions=resolved.get("factions", {}),
+        )
+        char_profiles = build_character_profiles(
+            resolved.get("characters", {}), factions=resolved.get("factions", {}), evolutions=evolutions)
+        faction_profiles = build_faction_profiles(resolved.get("factions", {}), characters=resolved.get("characters", {}))
+        location_profiles = build_location_profiles(resolved.get("locations", {}))
+        power_profiles = build_power_profiles(resolved.get("powers", {}))
+        plot_arcs = synthesize_plot_arcs(
+            raw_data["chapters"], raw_data["narrative_summaries"],
+            resolved_characters=resolved.get("characters", {}),
+            resolved_locations=resolved.get("locations", {}),
+        )
+
+        l4_data = {
+            "synopsis": novel_metadata.get("synopsis", ""),
+            "outline": outline,
+            "character_profiles": char_profiles, "faction_profiles": faction_profiles,
+            "location_profiles": location_profiles, "power_profiles": power_profiles,
+            "plot_arcs": plot_arcs,
+            "retcons": l3_data.get("retcons", []), "gaps": l3_data.get("gaps", []),
+            "entity_summary": l3_data.get("stats", {}),
+            "ambiguous_merges": l3_data.get("ambiguous_merges", []),
+        }
+        (output_dir / "layer4_synthesis.json").write_text(
+            json.dumps(l4_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"  ✓ Layer 4 complete")
+        checkpoint_mgr.update_layer_state(4, status="completed", batches_completed=1, total_batches=1)
+
+    # ── Export ──
+    print("\n" + "=" * 60)
+    print("  Export: Markdown Reports")
+    print("=" * 60)
+
+    md_files = export_all(l4_data, output_dir / "reports",
+                          novel_title=novel_metadata.get("title", ""),
+                          author=novel_metadata.get("author", ""),
+                          layer2_dir=output_dir / "layer2")
+    for f in md_files:
+        print(f"  ✓ {f.name}")
+
+    review_path = export_human_review_sample(
+        layer2_output_dir, np_path, EXPORT_DIR, sample_size=20)
+    print(f"  ✓ Human review sample: {review_path.name}")
+
+    # ── Summary ──
+    elapsed = (datetime.now() - start_time).total_seconds()
+    usage = client.usage_summary
+    entity_summary = l3_data.get("stats", l4_data.get("entity_summary", {}))
+
+    print("\n" + "=" * 60)
+    print("  Pipeline Complete!")
+    print("=" * 60)
+    print(f"  Novel: {novel_metadata.get('title', '?')} by {novel_metadata.get('author', '?')}")
+    print(f"  Chapters: {len(chapters)}")
+    print(f"  Time: {elapsed:.0f}s")
+    print(f"  API Calls: {usage['calls']}")
+    print(f"  Tokens: {usage['total_tokens']:,}")
+    print(f"  Est. Cost: ${usage['estimated_cost_usd']:.2f}")
+    print(f"  Output: {output_dir}")
+    print(f"  Review: {review_path}")
+
+    return {
+        "success": True, "novel_metadata": novel_metadata,
+        "total_chapters": len(chapters), "total_batches": len(batches),
+        "elapsed_seconds": elapsed, "usage": usage,
+        "output_dir": str(output_dir), "review_file": str(review_path),
+        "entity_summary": entity_summary,
+    }
+
+
+def _layer2_files_exist(layer2_dir: Path) -> bool:
+    """Check if Layer 2 output files exist."""
+    return layer2_dir.exists() and len(list(layer2_dir.glob("batch_*.json"))) > 0
 
 
 def _extract_metadata(novel_path: Path, chapters: list) -> dict:

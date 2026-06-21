@@ -7,24 +7,33 @@ Groups chapters into coherent arcs based on:
 - Emotional peaks (climax detection)
 """
 
-from collections import defaultdict
-
 from novel_decomp.models.chapter import ChapterSummary
+from novel_decomp.layer4.profiles import _resolve_name
 
 
 def synthesize_plot_arcs(
     chapters: list[ChapterSummary],
     narrative_summaries: list[dict],
+    *,
+    resolved_characters: dict[str, dict] | None = None,
+    resolved_locations: dict[str, dict] | None = None,
 ) -> list[dict]:
     """Identify and construct plot arcs from chapter summaries.
 
     Args:
         chapters: Sorted chapter summaries.
         narrative_summaries: Batch narrative summaries (with arc_markers).
+        resolved_characters: Resolved character entities (id → entity dict),
+            used to normalize character names.
+        resolved_locations: Resolved location entities (id → entity dict),
+            used to normalize location names.
 
     Returns:
         List of arc dicts with structure suitable for PlotArc model.
     """
+    characters = resolved_characters or {}
+    locations = resolved_locations or {}
+
     arcs = []
     arc_id = 0
 
@@ -44,21 +53,15 @@ def synthesize_plot_arcs(
 
         arc_id += 1
 
-        # Determine arc type from chapter tags
-        all_tags = []
-        all_characters = set()
-        all_locations = set()
-        for ch in arc_chapters:
-            all_tags.extend(ch.plot_tags)
-            all_characters.update(ch.characters_appeared)
-            all_locations.update(ch.locations_visited)
-
-        tag_counts = defaultdict(int)
-        for t in all_tags:
-            tag_counts[t] += 1
-
         # Classify arc type
-        arc_type = _classify_arc_type(tag_counts, arc_chapters)
+        arc_type = _classify_arc_type(arc_chapters)
+        all_characters: set[str] = set()
+        all_locations: set[str] = set()
+        for ch in arc_chapters:
+            for c in ch.characters_appeared:
+                all_characters.add(c if isinstance(c, str) else c.get("名称", c.get("name", str(c))))
+            all_locations.update(ch.locations_visited)
+        _char_name_set = all_characters
 
         # Find emotional peak
         peak_chapter = _find_emotional_peak(arc_chapters)
@@ -67,10 +70,22 @@ def synthesize_plot_arcs(
         summary = _generate_arc_summary(arc_chapters, start_ch, end_ch, arc_type)
 
         # Find primary characters (appear in >50% of chapters)
+        # Resolve any entity IDs to display names
         ch_count = len(arc_chapters)
-        primary_characters = [
+        primary_characters_raw = [
             c for c in all_characters
-            if sum(1 for ch in arc_chapters if c in ch.characters_appeared) > ch_count * 0.5
+            if sum(1 for ch in arc_chapters
+                   if _char_in_chapter(c, ch)) > ch_count * 0.5
+        ]
+        primary_characters = [
+            _resolve_name(c, characters=characters)
+            for c in primary_characters_raw[:10]
+        ]
+
+        # Resolve location IDs to display names
+        primary_locations = [
+            _resolve_name(loc, entities=locations)
+            for loc in list(all_locations)[:10]
         ]
 
         arcs.append({
@@ -81,10 +96,9 @@ def synthesize_plot_arcs(
             "end_chapter": end_ch,
             "chapter_count": ch_count,
             "summary": summary,
-            "primary_characters": primary_characters[:10],
-            "primary_locations": list(all_locations)[:10],
+            "primary_characters": primary_characters,
+            "primary_locations": primary_locations,
             "emotional_peak_chapter": peak_chapter,
-            "top_tags": sorted(tag_counts.items(), key=lambda x: -x[1])[:5],
             "is_complete": end_ch < len(chapters),
             "beats": [
                 {
@@ -124,42 +138,19 @@ def _find_arc_boundaries(
 
 
 def _classify_arc_type(
-    tag_counts: dict,
     arc_chapters: list[ChapterSummary],
 ) -> str:
-    """Classify the arc type based on dominant tags and content."""
-    total = sum(tag_counts.values())
+    """Classify the arc type based on chapter count.
 
-    battle_ratio = tag_counts.get("战斗", 0) / max(total, 1)
-    training_ratio = tag_counts.get("修炼", 0) / max(total, 1)
-    adventure_ratio = tag_counts.get("冒险", 0) / max(total, 1)
-    mystery_ratio = tag_counts.get("解谜", 0) / max(total, 1)
-
-    if battle_ratio > 0.3:
-        return "战斗篇"
-    elif adventure_ratio > 0.3:
-        return "冒险篇"
-    elif training_ratio > 0.3:
-        return "修炼篇"
-    elif mystery_ratio > 0.2:
-        return "解谜篇"
-    elif len(arc_chapters) <= 5:
+    Simplified: without plot_tags, we use chapter count as a basic heuristic.
+    Full classification would need more semantic analysis.
+    """
+    if len(arc_chapters) <= 5:
         return "过渡篇"
+    elif len(arc_chapters) <= 15:
+        return "中篇"
     else:
-        # Check emotional tones
-        tones = [ch.emotional_tone for ch in arc_chapters if ch.emotional_tone]
-        if tones:
-            dominant_tone = max(set(tones), key=tones.count)
-            tone_map = {
-                "紧张": "冲突篇",
-                "悲伤": "情感篇",
-                "热血": "高潮篇",
-                "悬疑": "悬疑篇",
-                "温馨": "日常篇",
-            }
-            return tone_map.get(dominant_tone, "综合篇")
-
-    return "综合篇"
+        return "长篇章"
 
 
 def _find_emotional_peak(arc_chapters: list[ChapterSummary]) -> int:
@@ -183,10 +174,6 @@ def _find_emotional_peak(arc_chapters: list[ChapterSummary]) -> int:
         for ev in ch.key_events:
             if ev.type == "死亡":
                 score += 5
-
-        # Tone shifts boost score
-        if ch.emotional_tone in ("热血", "悲伤", "紧张"):
-            score += 2
 
         if score > peak_score:
             peak_score = score
@@ -224,3 +211,15 @@ def _generate_arc_summary(
     summary += f" 结束: {last.summary[:60]}..."
 
     return summary
+
+
+def _char_in_chapter(name: str, ch: ChapterSummary) -> bool:
+    """Check if a character name appears in a chapter (handles both str and dict formats)."""
+    for c in ch.characters_appeared:
+        if isinstance(c, str):
+            if c == name:
+                return True
+        elif isinstance(c, dict):
+            if c.get("名称", c.get("name", "")) == name:
+                return True
+    return False

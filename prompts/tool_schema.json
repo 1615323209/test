@@ -1,0 +1,423 @@
+{
+  "name": "provide_batch_analysis",
+  "description": "提供本章节的完整结构化分析，包括每章摘要、实体更新、叙事总结和伏笔。",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "叙事摘要": {
+        "type": "object",
+        "description": "本批次的压缩叙事摘要，将传递给后续批次作为滚动上下文",
+        "properties": {
+          "批次号": { "type": "integer" },
+          "章节范围": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "摘要": {
+            "type": "string",
+            "description": "200-400字的剧情摘要，概括本批次的主要情节发展"
+          },
+          "关键发展": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "3-5个本批次最重要的剧情发展，每个一句话"
+          },
+          "弧标记": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "检测到的故事弧过渡标记，如'换地图''大事件结束'等"
+          },
+          "关键事件": {
+            "type": "array",
+            "description": "本批次发生的不可逆关键事件（如角色死亡、世界毁灭、重大身份揭露）。没有则返回空数组 []",
+            "items": {
+              "type": "object",
+              "properties": {
+                "章节号": { "type": "integer", "description": "事件发生的章节号" },
+                "描述": { "type": "string", "description": "1-2句话描述该不可逆事件" },
+                "事件类型": {
+                  "type": "string",
+                  "enum": ["死亡", "复活", "世界变革", "突破", "毁灭", "身份揭露", "重大转折", "势力更迭", "觉醒", "封印解封", "陨落", "其他"],
+                  "description": "事件类型分类"
+                }
+              },
+              "required": ["章节号", "描述", "事件类型"]
+            }
+          }
+        },
+        "required": ["批次号", "章节范围", "摘要", "关键发展", "弧标记"]
+      },
+      "章节列表": {
+        "type": "array",
+        "description": "本批次每章的详细分析",
+        "items": {
+          "type": "object",
+          "properties": {
+            "章节号": { "type": "integer" },
+            "标题": { "type": "string" },
+            "摘要": {
+              "type": "string",
+              "description": "100-200字的章节摘要"
+            },
+            "关键事件": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "类型": {
+                    "type": "string",
+                    "enum": ["登场", "退场", "战斗", "对话", "转折", "设定揭示", "修炼", "死亡", "日常", "其他"]
+                  },
+                  "描述": { "type": "string" },
+                  "涉及角色": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                  },
+                  "重要程度": {
+                    "type": "string",
+                    "enum": ["主线关键", "次要", "过渡"]
+                  }
+                },
+                "required": ["类型", "描述"]
+              }
+            },
+            "视角角色": { "type": "string" },
+            "涉及地点": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "出场角色": {
+              "type": "array",
+              "description": "本章出场的所有角色及其情绪变化",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "名称": { "type": "string", "description": "角色中文名" },
+                  "情绪变化": {
+                    "type": "string",
+                    "description": "该角色在本章中的情绪变化，如'从平静转为暴怒'、'持续恐惧'"
+                  }
+                },
+                "required": ["名称"]
+              }
+            },
+            "人物关系": {
+              "type": "array",
+              "description": "本章人物之间的关系。每对关系只写一次。没有则返回空数组 []",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "角色": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "涉及的两个角色名"
+                  },
+                  "关系": { "type": "string", "description": "关系类型: 父子/母子/夫妻/兄弟/敌对/合作/朋友/师徒/..." },
+                  "描述": { "type": "string", "description": "本章中这两人之间发生了什么" }
+                },
+                "required": ["角色", "关系"]
+              }
+            },
+            "本章伏笔": {
+              "type": "array",
+              "description": "本章新埋下的伏笔。没有则返回空数组 []",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "描述": { "type": "string", "description": "伏笔内容，一句话说清楚" },
+                  "重要性": { "type": "string", "enum": ["主线", "支线", "小伏笔"] },
+                  "推测回收方式": { "type": "string", "description": "猜测后续如何回收（可选）" }
+                },
+                "required": ["描述", "重要性"]
+              }
+            },
+            "回收伏笔": {
+              "type": "array",
+              "description": "本章揭示/回收了之前某章埋下的伏笔。没有则返回空数组 []",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "描述": { "type": "string", "description": "被回收的伏笔内容" },
+                  "埋下章节": { "type": "integer", "description": "该伏笔最早在哪一章埋下的" },
+                  "回收方式": { "type": "string", "description": "本章是如何回收的" }
+                },
+                "required": ["描述"]
+              }
+            }
+          },
+          "required": ["章节号", "摘要", "关键事件"]
+        }
+      },
+      "实体更新": {
+        "type": "object",
+        "description": "本批次发现的新实体及对已知实体的更新",
+        "properties": {
+          "角色": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "稳定ID: char_拼音名（如 char_chenling）。若为已知实体则使用已有ID"
+                },
+                "名称": { "type": "string", "description": "角色的标准中文名" },
+                "别名": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "该角色的其他称呼、外号、尊称"
+                },
+                "首次出场": { "type": "integer", "description": "该角色在本小说中第一次出现的章节号" },
+                "最近出场": { "type": "integer", "description": "该角色目前最后一次出现的章节号" },
+                "角色定位": {
+                  "type": "string",
+                  "enum": ["主角", "配角", "反派", "路人", "导师", "恋人", "家人", "其他"]
+                },
+                "性别": {
+                  "type": "string",
+                  "description": "角色性别。从文中推断，如'男'/'女'/'未知'。不要留空"
+                },
+                "年龄": {
+                  "type": "string",
+                  "description": "角色的年龄描述。首次出场写'16岁'/'中年'等。如果故事时间跨度大、年龄有变化，写范围如'16岁→18岁'或'16岁(登场时)'。不要写死为固定值。不要留空"
+                },
+                "背景": {
+                  "type": "string",
+                  "description": "角色的背景简介。包括童年经历、家庭情况、身世来历、过往重大经历等。如'出身寒霜街贫民窟，幼年丧父，由母亲抚养长大'。已知信息较少时填'未知'，有新信息时更新"
+                },
+                "口头禅": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "该角色经常说的口头禅、标志性语句。如'有趣、有趣'。没有则返回空数组 []"
+                },
+                "外貌特征": {
+                  "type": "array",
+                  "description": "该角色标志性的外貌/服饰特点。提到这个特征就能联想到该角色。没有则返回空数组 []",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "特征": { "type": "string", "description": "外貌/服饰特征描述，如'大红戏袍'、'狐狸面具'" },
+                      "出现章节": { "type": "integer", "description": "该特征首次出现的章节号" },
+                      "来源": { "type": "string", "description": "该特征是如何获得的，如'穿越时自带的戏袍'、'在戏剧节获赠的面具'" }
+                    },
+                    "required": ["特征", "出现章节"]
+                  }
+                },
+                "所属势力": { "type": "string", "description": "该角色当前公开所属的势力名称" },
+                "势力归属": {
+                  "type": "array",
+                  "description": "记录该角色势力归属的每次变化。初次出现时记录初始归属。注意：角色可同时属于多个势力（如卧底身份）。没有变化则返回空数组 []",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "势力": { "type": "string", "description": "势力名称" },
+                      "确定章节": { "type": "integer", "description": "该归属关系确立的章节号" },
+                      "性质": { "type": "string", "enum": ["正式加入", "卧底潜伏", "隐藏身份揭露", "被驱逐", "主动退出", "联盟合作", "双重身份"], "description": "该归属的性质" },
+                      "备注": { "type": "string", "description": "补充说明，如'表面身份是执法者，实际是黄昏社安插的卧底'" }
+                    },
+                    "required": ["势力", "确定章节", "性质"]
+                  }
+                },
+                "性格特征": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "该角色当前展现的性格（如已变化则描述变化后的）"
+                },
+                "性格演变": {
+                  "type": "array",
+                  "description": "记录该角色性格的每次重大转变。首次出现时填写初始性格。没有变化则返回空数组 []",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "章节": { "type": "integer", "description": "发生转变的章节号（初始性格填首次出场章节）" },
+                      "性格": { "type": "array", "items": { "type": "string" }, "description": "转变后的性格特征" },
+                      "触发事件": { "type": "string", "description": "导致性格转变的关键事件，如'目睹父母被杀'、'被挚友背叛'等" }
+                    },
+                    "required": ["章节", "性格", "触发事件"]
+                  }
+                },
+                "能力提示": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "该角色当前拥有的能力（如已变化则描述变化后的）"
+                },
+                "能力演变": {
+                  "type": "array",
+                  "description": "记录该角色能力的每次重大变化。首次出现时填写初始能力。没有变化则返回空数组 []",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "章节": { "type": "integer", "description": "发生变化的章节号" },
+                      "新增": { "type": "array", "items": { "type": "string" }, "description": "新获得的能力" },
+                      "触发事件": { "type": "string", "description": "导致获得该能力的事件，如'在兵道古藏中觉醒'、'被观众篡夺身体后获得'" }
+                    },
+                    "required": ["章节", "新增", "触发事件"]
+                  }
+                },
+                "状态": {
+                  "type": "string",
+                  "enum": ["活跃", "已死亡", "失踪", "未知"]
+                },
+                "关系网": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "对象": { "type": "string", "description": "关系对方的角色名（用实际名字，如'陈伶'）" },
+                      "关系": { "type": "string", "description": "关系类型: 师徒/敌对/血亲/朋友/恋人/同盟/上下级/利益" },
+                      "描述": { "type": "string", "description": "一句话描述这段关系的动态" }
+                    },
+                    "required": ["对象", "关系"]
+                  }
+                },
+                "是否新实体": { "type": "boolean", "description": "本批次首次出现的角色为true" },
+                "是否更新": { "type": "boolean", "description": "对已存在角色的信息补充为true" }
+              },
+              "required": ["id", "名称", "角色定位", "是否新实体"]
+            }
+          },
+          "势力": {
+            "type": "array",
+            "description": "有组织的群体（宗门/家族/帮派/王朝/军队/商盟等，须有名称和≥2成员）。注意：城市、街道、建筑是【地点】，不要放在这里！",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string", "description": "稳定ID: fact_拼音名" },
+                "名称": { "type": "string" },
+                "势力类型": { "type": "string", "description": "宗门/家族/国家/组织/商会/佣兵团/..." },
+                "首领": { "type": "string", "description": "首领的中文名" },
+                "成员": { "type": "array", "items": { "type": "string" }, "description": "已知成员的中文名" },
+                "势力范围": { "type": "string", "description": "势力控制的地域" },
+                "实力评估": {
+                  "type": "string",
+                  "description": "对该势力综合实力的评估，如'极光界域顶级'、'二流宗门'、'新兴小组织'。从文中角色对话或叙述中推断"
+                },
+                "目标": {
+                  "type": "array",
+                  "description": "该势力的目标/野心。目标可能随着章节变化。没有明确目标则返回空数组 []",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "描述": { "type": "string", "description": "目标描述，如'统御整个极光界域'" },
+                      "确定章节": { "type": "integer", "description": "该目标首次被揭示或确立的章节号" },
+                      "状态": { "type": "string", "enum": ["进行中", "已达成", "已放弃", "已变更"], "description": "该目标的当前状态" }
+                    },
+                    "required": ["描述", "确定章节"]
+                  }
+                },
+                "描述": { "type": "string" },
+                "首次出场": { "type": "integer" },
+                "是否新实体": { "type": "boolean" }
+              },
+              "required": ["id", "名称", "是否新实体"]
+            }
+          },
+          "地点": {
+            "type": "array",
+            "description": "地理/物理场所（城市、街道、建筑、山脉、秘境、洞府、星球等）",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string", "description": "稳定ID: loc_拼音名" },
+                "名称": { "type": "string" },
+                "地点类型": { "type": "string", "description": "城市/宗门/秘境/星球/建筑/国家/..." },
+                "所属区域": { "type": "string", "description": "该地点属于哪个更大的区域。如'一区'属于'极光界域'，'寒霜街'属于'一区'。最外层地点留空" },
+                "描述": { "type": "string" },
+                "重要性": { "type": "string", "description": "该地点在故事中的重要性" },
+                "首次出场": { "type": "integer" },
+                "是否新实体": { "type": "boolean" }
+              },
+              "required": ["id", "名称", "是否新实体"]
+            }
+          },
+          "功法能力": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string", "description": "稳定ID: pow_拼音名。若为道途体系，用 pow_道途拼音，如 pow_xidao" },
+                "名称": { "type": "string", "description": "道途名、功法名、或能力名" },
+                "类别": {
+                  "type": "string",
+                  "description": "体系/道途/修炼功法/武技/法术/天赋/丹药/法宝/系统能力/... 最顶层修炼框架（如'十四神道'）填'体系'，其下的具体神道（如'兵神道'）也填'体系'并通过所属体系建立层级"
+                },
+                "所属体系": {
+                  "type": "string",
+                  "description": "该功法/道途所属的上级体系名称。如'兵神道'属于'十四神道'，'审判路径'属于'兵神道'。最顶层体系（如'十四神道'）留空。支持多级嵌套"
+                },
+                "使用者": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "拥有此能力的角色名"
+                },
+                "等级体系": {
+                  "type": "object",
+                  "description": "该功法/道途的等级体系。只填文中明确提到的信息，不要编造！",
+                  "properties": {
+                    "总阶数": { "type": "integer", "description": "文中提到的总阶数。未知则填 0" },
+                    "阶名列表": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "文中已出现的具体阶名，如 ['铁衣','青甲','银胄']。不要编造'一阶/二阶'！文中的阶名未知时留空数组 []"
+                    },
+                    "阶详情": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "阶数": { "type": "integer" },
+                          "阶名": { "type": "string", "description": "这一阶的名称（如'铁衣'）。不知道不要编造，填'未知'或留空" },
+                          "进阶方式": { "type": "string", "description": "如何从上一阶晋升到这一阶。未知则留空" },
+                          "获得能力": { "type": "array", "items": { "type": "string" }, "description": "到达这一阶后获得的能力/力量。未知则返回空数组" },
+                          "代表人物": { "type": "array", "items": { "type": "string" }, "description": "文中已到达这一阶的角色名" }
+                        },
+                        "required": ["阶数", "阶名"]
+                      }
+                    }
+                  }
+                },
+                "来源": { "type": "string", "description": "该能力的来源，如'极光界域通用体系'/'主角独有'/'某传承'" },
+                "描述": { "type": "string", "description": "道途/能力的一句话概述" },
+                "限制": { "type": "array", "items": { "type": "string" }, "description": "使用限制、代价、弱点、副作用" },
+                "首次出场": { "type": "integer" },
+                "是否新实体": { "type": "boolean" }
+              },
+              "required": ["id", "名称", "是否新实体"]
+            }
+          }
+        }
+      },
+      "伏笔": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "描述": { "type": "string", "description": "伏笔内容描述" },
+            "章节": { "type": "integer", "description": "埋下伏笔的章节号" },
+            "重要性": { "type": "string", "enum": ["主线", "支线"] },
+            "推测回收": { "type": "string", "description": "猜测这个伏笔后续会如何回收" }
+          },
+          "required": ["描述", "章节"]
+        }
+      },
+      "与前文矛盾": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "章节": { "type": "integer" },
+            "主题": { "type": "string" },
+            "描述": { "type": "string", "description": "矛盾的具体描述" },
+            "矛盾章节": { "type": "integer", "description": "与此矛盾的先前章节号" }
+          },
+          "required": ["描述"]
+        }
+      }
+    },
+    "required": ["叙事摘要", "章节列表", "实体更新"]
+  }
+}

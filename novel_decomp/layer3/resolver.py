@@ -11,25 +11,25 @@ import re
 from typing import Optional
 
 
-def resolve_entities(raw_collection: dict) -> dict:
+def resolve_entities(
+    raw_collection: dict,
+    *,
+    location_chapters: dict[str, list[int]] | None = None,
+    char_chapters: dict[str, list[int]] | None = None,
+) -> dict:
     """Resolve entity duplicates across all batches.
 
     Args:
-        raw_collection: Output from collate_batch_results, containing
-            raw_characters, raw_factions, raw_locations, raw_powers.
+        raw_collection: Output from collate_batch_results.
+        location_chapters: {name: [chapter_numbers]} from all chapters.
+        char_chapters: {name: [chapter_numbers]} from all chapters.
 
     Returns:
-        Dict with resolved entities:
-            - characters: dict keyed by canonical ID
-            - factions: dict keyed by canonical ID
-            - locations: dict keyed by canonical ID
-            - powers: dict keyed by canonical ID
-            - resolution_stats: dict with merge counts
+        Dict with resolved entities keyed by canonical ID, plus resolution_stats.
     """
     result = {}
     stats = {}
 
-    # Resolve each entity type
     for entity_type in ["characters", "factions", "locations", "powers"]:
         raw_key = f"raw_{entity_type}"
         raw_entities = raw_collection.get(raw_key, [])
@@ -42,8 +42,38 @@ def resolve_entities(raw_collection: dict) -> dict:
             "merges": merge_count,
         }
 
+    # Inject per-chapter appearance data
+    if location_chapters:
+        _inject_chapter_presence(result.get("locations", {}), location_chapters)
+    if char_chapters:
+        _inject_chapter_presence(result.get("characters", {}), char_chapters)
+
     result["resolution_stats"] = stats
     return result
+
+
+def _inject_chapter_presence(
+    entities: dict[str, dict],
+    name_to_chapters: dict[str, list[int]],
+) -> None:
+    """Inject chapters_present into resolved entities by matching names.
+
+    Tries: canonical_name, then all fields that look like a name,
+    then alias matching.
+    """
+    for eid, entity in entities.items():
+        found = set()
+        for name_source in [
+            entity.get("canonical_name", ""),
+            entity.get("名称", ""),
+            *entity.get("aliases", []),
+        ]:
+            if name_source in name_to_chapters:
+                found.update(name_to_chapters[name_source])
+        if found:
+            entity["chapters_present"] = sorted(found)
+        else:
+            entity["chapters_present"] = []
 
 
 def _resolve_entity_list(

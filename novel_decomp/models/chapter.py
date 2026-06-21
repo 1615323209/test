@@ -35,11 +35,28 @@ class ChapterSummary(BaseModel):
     key_events: list[KeyEvent] = Field(default_factory=list, description="Key events this chapter")
     pov_character: str = Field(default="", description="Point-of-view character name")
     locations_visited: list[str] = Field(default_factory=list, description="Locations appearing this chapter")
-    characters_appeared: list[str] = Field(default_factory=list, description="Characters appearing this chapter")
-    reveals: list[str] = Field(default_factory=list, description="New information revealed this chapter")
-    timeline_hint: str = Field(default="", description="Story timeline marker, e.g. '第3天' or '一年后'")
-    emotional_tone: str = Field(default="", description="Emotional atmosphere: 紧张/轻松/悲伤/热血/悬疑/...")
-    plot_tags: list[str] = Field(default_factory=list, description="Tags: 战斗/修炼/日常/冒险/政治/...")
+    characters_appeared: list[dict] = Field(default_factory=list, description="Characters appearing this chapter (name + emotion)")
+    character_relationships: list[dict] = Field(default_factory=list, description="Relationships between characters this chapter")
+    foreshadowing_planted: list[dict] = Field(default_factory=list, description="Foreshadowing planted this chapter")
+    foreshadowing_resolved: list[dict] = Field(default_factory=list, description="Foreshadowing resolved this chapter (references prior chapter)")
+
+
+class CriticalEvent(BaseModel):
+    """An irreversible, state-changing story event that must be tracked across all batches.
+
+    Persisted in the critical_events_log to detect long-span contradictions
+    (e.g. character killed in ch79 reappearing in ch189 with no explanation).
+    """
+    chapter_number: int = Field(description="Chapter where this event occurred")
+    description: str = Field(description="1-2 sentence description of the critical event")
+    event_type: str = Field(
+        default="其他",
+        description="Event category: 死亡/复活/世界变革/突破/毁灭/身份揭露/重大转折/势力更迭/觉醒/封印解封/陨落/其他"
+    )
+    event_id: str = Field(
+        default="",
+        description="Dedup key — auto-generated in analyzer: ev_{ch}_{type}_{desc_hash}"
+    )
 
 
 class BatchNarrativeSummary(BaseModel):
@@ -49,6 +66,10 @@ class BatchNarrativeSummary(BaseModel):
     summary: str = Field(description="200-400 character narrative summary of this batch")
     major_developments: list[str] = Field(default_factory=list, description="Major plot developments, 1 sentence each")
     arc_markers: list[str] = Field(default_factory=list, description="Story arc transition markers detected")
+    critical_events: list[CriticalEvent] = Field(
+        default_factory=list,
+        description="New irreversible critical events detected in this batch"
+    )
 
 
 class BatchEntitySnapshot(BaseModel):

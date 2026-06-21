@@ -25,8 +25,6 @@ from .plot import (
 )
 from .pipeline import (
     LayerState,
-    PipelineState,
-    Checkpoint,
 )
 
 __all__ = [
@@ -52,6 +50,4 @@ __all__ = [
     "ArcConnection",
     # Pipeline
     "LayerState",
-    "PipelineState",
-    "Checkpoint",
 ]

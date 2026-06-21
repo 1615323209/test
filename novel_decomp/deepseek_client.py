@@ -36,11 +36,7 @@ class DeepSeekClient:
     ):
         self.api_key = api_key or DEEPSEEK_API_KEY
 
-        # DeepSeek uses the OpenAI endpoint, NOT the /anthropic endpoint
         self.base_url = base_url or "https://api.deepseek.com"
-        # If .env still has the /anthropic URL, auto-correct
-        if "anthropic" in self.base_url:
-            self.base_url = "https://api.deepseek.com"
 
         self.model = model or DEFAULT_MODEL
         self.client = AsyncOpenAI(
@@ -137,7 +133,7 @@ class DeepSeekClient:
         tool_schema: dict,
         *,
         model: str = "",
-        max_tokens: int = 16384,
+        max_tokens: int = 32768,
         temperature: float = 0.3,
         layer: int = 0,
         batch_id: int = 0,
@@ -300,6 +296,80 @@ class DeepSeekClient:
         }
 
 
+def _recover_truncated_json(text: str, error_pos: int) -> dict | None:
+    """Recover truncated/corrupted JSON.
+
+    Tries:
+    1. Balance brackets/braces from error_pos forward
+    2. If that fails, scan backward from error_pos to find the last clean
+       structural boundary and retry from there
+    """
+    # Strategy 1: balance from error_pos
+    result = _balance_and_close(text, error_pos)
+    if result:
+        return result
+
+    # Strategy 2: scan backward to find last valid structural boundary
+    # Try progressively shorter prefixes — cut at each }, or ], or "
+    boundary_chars = []
+    for i, ch in enumerate(text[:error_pos]):
+        if ch in '}]"':
+            boundary_chars.append(i)
+
+    # Try from latest boundary backwards
+    for cut_pos in reversed(boundary_chars[-50:]):  # last 50 boundaries
+        # Skip if we're inside a string
+        result = _balance_and_close(text, cut_pos + 1)
+        if result:
+            return result
+
+    return None
+
+
+def _balance_and_close(text: str, cut_pos: int) -> dict | None:
+    """Balance brackets from text[:cut_pos] and close them to form valid JSON."""
+    prefix = text[:cut_pos]
+    stack = []
+    in_string = False
+    escape = False
+    for ch in prefix:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in '{[':
+            stack.append(ch)
+        elif ch == '}':
+            if stack and stack[-1] == '{':
+                stack.pop()
+        elif ch == ']':
+            if stack and stack[-1] == '[':
+                stack.pop()
+
+    closing = ''
+    if in_string:
+        closing += '"'
+    for ch in reversed(stack):
+        closing += '}' if ch == '{' else ']'
+
+    # Try candidates: progressively add closing chars
+    candidate = prefix.rstrip(',\n\r ')
+    for i in range(len(closing) + 1):
+        trial = candidate + closing[:i]
+        try:
+            return json.loads(trial)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 # ── Helper functions ──
 
 def _anthropic_tool_to_openai(anthropic_tool: dict) -> list[dict]:
@@ -356,15 +426,12 @@ def _extract_openai_tool_output(response) -> dict | None:
             try:
                 return json.loads(args_str)
             except json.JSONDecodeError as e:
-                # Truncated JSON? Try to recover
+                # Truncated JSON? Close all open brackets/braces
                 print(f"  ⚠ JSON parse error on function args "
                       f"(len={len(args_str)}, pos={e.pos}): {e}")
-                # Try to salvage by truncating to last valid position
-                truncated = args_str[:e.pos].rstrip(",") + "}"
-                try:
-                    return json.loads(truncated)
-                except json.JSONDecodeError:
-                    pass
+                recovered = _recover_truncated_json(args_str, e.pos)
+                if recovered:
+                    return recovered
                 return None
 
     # Method 2: Extract JSON from message content (fallback)

@@ -45,6 +45,7 @@ class Layer2Runner:
         self.entity_snapshot: dict = {}
         self.arc_summaries: list[dict] = []
         self.recent_summaries: list[dict] = []
+        self.critical_events_log: list[dict] = []
         self.results: list[BatchAnalysisOutput] = []
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -97,6 +98,7 @@ class Layer2Runner:
                     novel_metadata=self.novel_metadata,
                     rolling_summary=rolling_context,
                     entity_snapshot=entity_md,
+                    critical_events_log=self.critical_events_log,
                     model=self.model,
                 )
                 self.results.append(result)
@@ -181,6 +183,24 @@ class Layer2Runner:
             if len(self.arc_summaries) > 10:
                 self.arc_summaries = self.arc_summaries[-10:]
 
+        # Accumulate critical events from batch output
+        MAX_CRITICAL_EVENTS = 30
+        existing_ids = {e.get("event_id") for e in self.critical_events_log}
+        for ce in ns.critical_events:
+            event_dict = {
+                "chapter_number": ce.chapter_number,
+                "description": ce.description,
+                "event_type": ce.event_type,
+                "event_id": ce.event_id or f"ev_{ce.chapter_number}_{ce.event_type[:8]}_{ce.description[:20]}",
+            }
+            if event_dict["event_id"] not in existing_ids:
+                self.critical_events_log.append(event_dict)
+                existing_ids.add(event_dict["event_id"])
+
+        # Prune oldest events if log exceeds maximum
+        if len(self.critical_events_log) > MAX_CRITICAL_EVENTS:
+            self.critical_events_log = self.critical_events_log[-MAX_CRITICAL_EVENTS:]
+
         # Merge entity updates
         eu = result.entity_updates
         entity_updates_dict = {
@@ -216,7 +236,7 @@ class Layer2Runner:
         """Save a single batch result as JSON."""
         output_path = self.output_dir / f"batch_{result.batch_id:04d}.json"
         output_path.write_text(
-            result.model_dump_json(indent=2, ensure_ascii=False),
+            result.model_dump_json(indent=2),
             encoding="utf-8",
         )
 
@@ -250,6 +270,7 @@ class Layer2Runner:
                 "recent_summaries": self.recent_summaries,
                 "arc_summaries": self.arc_summaries,
                 "entity_snapshot": self.entity_snapshot,
+                "critical_events_log": self.critical_events_log,
             },
             "usage": self.client.usage_summary,
             "updated_at": datetime.now().isoformat(),
@@ -269,10 +290,11 @@ class Layer2Runner:
         return None
 
     @classmethod
-    def restore_state(cls, checkpoint: dict) -> tuple[dict, str, list[dict], list[dict]]:
+    def restore_state(cls, checkpoint: dict) -> tuple[dict, str, list[dict], list[dict], list[dict]]:
         """Restore rolling state from checkpoint.
 
-        Returns: (entity_snapshot, rolling_summary, recent_summaries, arc_summaries)
+        Returns: (entity_snapshot, rolling_summary, recent_summaries,
+                  arc_summaries, critical_events_log)
         """
         rc = checkpoint.get("rolling_context", {})
         return (
@@ -280,6 +302,7 @@ class Layer2Runner:
             "",  # rolling_summary is rebuilt from summaries
             rc.get("recent_summaries", []),
             rc.get("arc_summaries", []),
+            rc.get("critical_events_log", []),  # defaults to [] for old checkpoints
         )
 
     def _print_entity_stats(self):

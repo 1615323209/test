@@ -14,6 +14,7 @@ load_dotenv(override=True)
 # Project root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
+PROMPTS_DIR = PROJECT_ROOT / "prompts"
 
 # ── Provider ──
 PROVIDER = os.getenv("NOVEL_DECOMP_PROVIDER", "anthropic").lower()  # "anthropic" or "deepseek"
@@ -22,9 +23,14 @@ PROVIDER = os.getenv("NOVEL_DECOMP_PROVIDER", "anthropic").lower()  # "anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # For Anthropic provider: https://api.anthropic.com
 # For DeepSeek provider: https://api.deepseek.com (native OpenAI endpoint)
+DEFAULT_BASE_URLS = {
+    "anthropic": "https://api.anthropic.com",
+    "deepseek": "https://api.deepseek.com",
+    "zkmj": "https://ai.zkmjnic.tech/v1",
+}
 ANTHROPIC_BASE_URL = os.getenv(
     "ANTHROPIC_BASE_URL",
-    "https://api.deepseek.com" if PROVIDER == "deepseek" else "https://api.anthropic.com",
+    DEFAULT_BASE_URLS.get(PROVIDER, "https://api.anthropic.com"),
 )
 
 # ── Models ──
@@ -35,6 +41,10 @@ _PROVIDER_DEFAULTS = {
         "cheap": "claude-haiku-4-5-20251001",
     },
     "deepseek": {
+        "main": "deepseek-v4-pro",
+        "cheap": "deepseek-v4-flash",
+    },
+    "zkmj": {
         "main": "deepseek-v4-pro",
         "cheap": "deepseek-v4-flash",
     },
@@ -128,7 +138,7 @@ def create_client(
     Returns:
         AnthropicClient or DeepSeekClient instance.
     """
-    if PROVIDER == "deepseek":
+    if PROVIDER in ("deepseek", "zkmj"):
         from novel_decomp.deepseek_client import DeepSeekClient
         return DeepSeekClient(
             api_key=ANTHROPIC_API_KEY,

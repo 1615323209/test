@@ -31,4 +31,6 @@ packages = [
     "novel_decomp.export",
     "novel_decomp.pipeline",
     "novel_decomp.scripts",
+    "novel_decomp.rewrite",
+    "novel_decomp.writer",
 ]

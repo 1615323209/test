@@ -53,17 +53,19 @@ def export_human_review_sample(
         try:
             batch = json.loads(bf.read_text(encoding="utf-8"))
             for ch in batch.get("chapters", []):
+                chars = ch.get("characters_appeared", [])
+                locs = ch.get("locations_visited", [])
+                # Normalize: extract strings from dicts if schema changed
+                _chars = [c if isinstance(c, str) else c.get("名称", c.get("name", str(c))) for c in chars]
+                _locs = [l if isinstance(l, str) else l.get("名称", l.get("name", str(l))) for l in locs]
                 all_analyses.append({
                     "chapter_number": ch.get("chapter_number", 0),
                     "title": ch.get("title", ""),
                     "summary": ch.get("summary", ""),
                     "key_events": [ev.get("description", "") for ev in ch.get("key_events", [])],
                     "pov": ch.get("pov_character", ""),
-                    "characters": ch.get("characters_appeared", []),
-                    "locations": ch.get("locations_visited", []),
-                    "reveals": ch.get("reveals", []),
-                    "tone": ch.get("emotional_tone", ""),
-                    "tags": ch.get("plot_tags", []),
+                    "characters": _chars,
+                    "locations": _locs,
                     "batch_id": batch.get("batch_id", 0),
                 })
         except (json.JSONDecodeError, OSError):
@@ -97,8 +99,7 @@ def export_human_review_sample(
         "- [ ] **关键事件**: 事件描述是否正确？事件类型标注是否合理？",
         "- [ ] **角色识别**: 出场角色是否全部被识别？POV角色是否正确？",
         "- [ ] **地点识别**: 地点是否正确提取？",
-        "- [ ] **情感基调**: 情感标签是否准确？",
-        "- [ ] **剧情标签**: 标签是否合理？",
+         "",
         "",
         "## 评分标准",
         "",
@@ -119,8 +120,6 @@ def export_human_review_sample(
         lines.append(f"| 项目 | AI分析 | 人工评分 | 备注 |")
         lines.append(f"|------|--------|----------|------|")
         lines.append(f"| POV角色 | {sample.get('pov', '?')} | ➡️ | |")
-        lines.append(f"| 情感基调 | {sample.get('tone', '?')} | ➡️ | |")
-        lines.append(f"| 剧情标签 | {', '.join(sample.get('tags', [])[:5])} | ➡️ | |")
         lines.append(f"| 摘要 | {sample.get('summary', '')[:150]}... | ➡️ | |")
         lines.append("")
         lines.append(f"**关键事件**:")
@@ -130,7 +129,7 @@ def export_human_review_sample(
         lines.append(f"**出场角色** ({len(sample.get('characters', []))}人): "
                      f"{', '.join(sample.get('characters', [])[:10])}")
         lines.append(f"**出场地点**: {', '.join(sample.get('locations', [])[:5]) or '无'}")
-        lines.append(f"**揭示信息**: {', '.join(sample.get('reveals', [])[:5]) or '无'}")
+        lines.append("")
         lines.append("")
 
         # Original text excerpt
@@ -154,8 +153,7 @@ def export_human_review_sample(
         lines.append("| 关键事件 | ⬜ | |")
         lines.append("| 角色识别 | ⬜ | |")
         lines.append("| 地点识别 | ⬜ | |")
-        lines.append("| 情感基调 | ⬜ | |")
-        lines.append("| 剧情标签 | ⬜ | |")
+        lines.append("")
         lines.append("")
         lines.append(f"**总体评价**: ___________")
         lines.append("")
@@ -166,57 +164,3 @@ def export_human_review_sample(
     output_path = output_dir / f"human_review_sample_{sample_size}chapters.md"
     output_path.write_text("\n".join(lines), encoding="utf-8")
     return output_path
-
-
-def export_verification_summary(
-    review_file: str | Path,
-    output_path: str | Path,
-) -> Path:
-    """Parse a filled-in review file and generate accuracy summary.
-
-    This is a stub — in production, this would parse the checkbox/emoji
-    markers in the review file and compute accuracy metrics.
-
-    Args:
-        review_file: Path to the human-filled review markdown file.
-        output_path: Where to write the summary.
-
-    Returns:
-        Path to the summary file.
-    """
-    review_path = Path(review_file)
-    summary_path = Path(output_path)
-
-    if not review_path.exists():
-        raise FileNotFoundError(f"Review file not found: {review_path}")
-
-    # Simple stub: count ✅ vs ❌ markers
-    content = review_path.read_text(encoding="utf-8")
-    accurate = content.count("✅")
-    partial = content.count("⚠️")
-    errors = content.count("❌")
-
-    total = accurate + partial + errors
-    accuracy = accurate / max(total, 1) * 100
-
-    summary = [
-        "# 人工验证结果汇总",
-        "",
-        f"- 总评分项: {total}",
-        f"- 准确 (✅): {accurate} ({accuracy:.1f}%)",
-        f"- 部分偏差 (⚠️): {partial} ({partial / max(total, 1) * 100:.1f}%)",
-        f"- 严重错误 (❌): {errors} ({errors / max(total, 1) * 100:.1f}%)",
-        "",
-        f"### 准确率: {accuracy:.1f}%",
-        "",
-    ]
-
-    if accuracy >= 90:
-        summary.append("✅ **通过** — AI分析质量达标")
-    elif accuracy >= 75:
-        summary.append("⚠️ **基本通过** — 建议优化部分提示词")
-    else:
-        summary.append("❌ **未通过** — 需要重新设计分析策略")
-
-    summary_path.write_text("\n".join(summary), encoding="utf-8")
-    return summary_path

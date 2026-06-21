@@ -23,25 +23,39 @@ def detect_retcons(
     *,
     raw_characters: list[dict] | None = None,
     raw_factions: list[dict] | None = None,
+    all_narrative_summaries: list[dict] | None = None,
 ) -> list[dict]:
     """Detect author contradictions (retcons) across the entire novel.
 
     Layer 2 per-batch contradictions are passed through. Then global
     cross-batch scans catch what Layer 2 missed due to context limits.
 
+    Death reversals are checked against critical event logs: if the model
+    flagged a 复活 (resurrection) event explaining the return, it's not a retcon.
+
     Args:
         resolved_characters: Resolved character entities (id → dict).
         resolved_factions: Resolved faction entities (id → dict).
         all_contradictions: Per-batch contradictions flagged by Layer 2.
-        raw_characters: (Optional) Raw character records from all batches
-            for building status timelines. If None, timeline scan is skipped.
+        raw_characters: (Optional) Raw character records from all batches.
         raw_factions: (Optional) Raw faction records for timeline scan.
+        all_narrative_summaries: (Optional) Narrative summaries with critical events.
 
     Returns:
         List of retcon dicts with: chapter, subject, description,
         prior_chapter, source, severity.
     """
     retcons = []
+
+    # Build set of chapters where resurrections occurred
+    resurrection_chapters: set[int] = set()
+    if all_narrative_summaries:
+        for ns in all_narrative_summaries:
+            for ce in ns.get("critical_events", []):
+                if ce.get("event_type") in ("复活", "resurrection"):
+                    ch = ce.get("chapter_number", ce.get("章节号", 0))
+                    if ch:
+                        resurrection_chapters.add(ch)
 
     # ── Pass through Layer 2 per-batch contradictions ──
     for c in all_contradictions:
@@ -64,7 +78,10 @@ def detect_retcons(
                 ch = entry["chapter"]
                 st = entry["status"]
                 # Death reversal: was deceased, now active again
+                # Skip if model reported a 复活 event (intentional plot, not retcon)
                 if prev_status == "deceased" and st == "active":
+                    if ch in resurrection_chapters:
+                        continue  # ponytail: intentional resurrection, not a retcon
                     char_name = _resolve_name_from_raw(char_id, raw_characters)
                     retcons.append({
                         "chapter": ch,
