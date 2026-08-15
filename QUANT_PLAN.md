@@ -16,9 +16,12 @@
 | `market_daily.parquet` | 市场情绪4032天 | 215KB |
 | `north_fund_flow.parquet` | 北向资金2729条 | 242KB |
 | `hs300.parquet` | 沪深300+MA20 | 144KB |
+| `factor_daily_incr.parquet` | 每日增量因子（新交易日，多文件scan读取） | 小 |
 | `mined_factors.csv` | 因子挖掘结果2340候选 | 小 |
 
 **数据源**：腾讯 `qt.gtimg.cn`。东方财富 push2 反爬（Session预热可破解但限频严格）。
+
+**每日更新机制**：`update_daily.py`（requests直连 proxy.finance.qq.com + 10线程并行，4919只约100秒）+ `update_hs300.py` + `factors.py`（因子计算模块）。新数据写增量文件不动3.3GB大文件，读取时多文件 scan（避免 OOM）。
 
 **核心脚本**：`collect_hfq`(采集) / `build_factors_pl`(因子) / `extract_bt_cols`(精简) / `ic_step1+2`(IC体检) / `mine_factors`(挖掘) / `backtest_v7`(当前策略) / `walk_forward_v7`(验证) / `freq_test`(提频) / `sensitivity` / `validation` / `attribution`
 
@@ -119,11 +122,22 @@ TOP_N=8: -7.64%  245笔  Sharpe 0.77  回撤-13.7%
 
 ### P3：工程与实盘
 5. ⬜ 回测框架标准化（测试套件）
-6. ✅ **模拟盘工具**：`daily_picks.py` 每日打分选股清单（v7 逻辑）
-   - 用法：`python daily_picks.py [日期]`，输出市场状态 + Top5 候选 + 买入可行性
-   - **发现**：2000元/仓买不满100股（>19.5元股票）→ 已加价格过滤，候选只显示可买标的
-   - 输出目录：`daily_picks/picks_<日期>.csv`
-7. ✅ 模拟盘定时任务：工作日 15:30 自动生成清单推送到 QQ
+6. ✅ **模拟盘全链路**（已上线）：
+   - `daily_picks.py`：每日打分选股清单（v7逻辑），2000元/仓价格过滤（<19.5元），输出 `daily_picks/picks_<日期>.csv`
+   - `paper_trading.py`：模拟盘引擎（持仓跟踪 + 自动买卖 + 盈亏统计），状态存 `paper_positions.json` / `paper_cash.txt` / `paper_trades.csv`
+   - **发现**：2000元/仓买不满100股（>19.5元股票）→ 已加价格过滤
+7. ✅ **定时任务（3个，工作日）**：
+   - 15:10 数据更新（行情+因子+hs300）
+   - 次日9:15 选股清单推送（QQ）
+   - 9:20 模拟盘引擎自动交易报告
+   - **买入时机：9:30 开盘按 9:15 清单执行**（T日收盘信号 → T+1买入）
+
+### 模拟盘规则
+```
+10仓×2000元 | 止损-8% | 止盈+12% | 保本(曾盈3%回落+1%)
+破MA20减半 | 破MA60清 | 时间止损20天(未涨5%) | T+1 | 跌停不可卖
+市场条件≥2/3才操作（涨停>60 + 沪深300站上MA20 + 北向净流入）
+```
 
 ---
 
@@ -140,12 +154,12 @@ TOP_N=8: -7.64%  245笔  Sharpe 0.77  回撤-13.7%
 ## 七、踩过的坑
 
 1. 东方财富反爬：Session预热+限频；AKShare内部不共享Session
-2. 内存不足：Polars分批batch+pyarrow合并；回测用精简列
+2. 内存不足：Polars分批batch+pyarrow合并；回测用精简列；**增量更新用多文件scan不动大文件**
 3. 回测哑火bug：固定仓位→动态仓位（已修复）
 4. 腾讯前复权负数：改用后复权
 5. GFW：GitHub同步走Windows；hosts指向140.82.113.3绕SNI干扰；classic token
-6. polars性能：逐日filter全表极慢→partition_by分组一次搞定
-7. polars细节：mean()遇NaN传播需fill_nan().drop_nulls()
+6. polars性能：逐日filter全表极慢→partition_by分组；**akshare采集挂起→requests直连+10线程并行（97秒/4919只）**
+7. polars细节：mean()遇NaN传播需fill_nan().drop_nulls()；**concat要求schema保序且dtype一致；set无序导致列序错乱**
 8. DeepSeek切换：config.yaml + systemd-run重启gateway
 
 ---
