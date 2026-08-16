@@ -1,14 +1,34 @@
 # A股因子库清单（FACTOR LIBRARY）
 
 > 更新时间：2026-08-16
-> 数据文件：`factor_daily.parquet`（3.3GB）+ `factor_daily_incr.parquet`（每日增量）
+> 数据文件：`factor_daily.parquet`（3.3GB）+ `factor_daily_incr.parquet`（每日增量）—— **2026-08-16 起存于 Windows 本地 `D:\quant_data\`**
 > 构建脚本：`build_factors_pl.py`（全量，polars 分批）/ `factors.py`（因子计算模块，增量共用）
-> 完整研究背景见 [QUANT_PLAN.md](./QUANT_PLAN.md)
+> 因子挖掘历史与完整研究背景见 [策略版本日志.md](./策略版本日志.md)
+
+---
+
+## 〇、因子数据文件（本地地址）
+
+**2026-08-16 起全部量化数据存于 Windows 本地 `D:\quant_data\`**。本表只列**因子类**数据；行情/资金/市场类见 [股票数据资产.md](./股票数据资产.md)，新闻类见 [新闻数据资产.md](./新闻数据资产.md)。
+
+| 文件 | 内容 | 大小 | 实际地址 |
+|------|------|------|----------|
+| `factor_daily.parquet` | **45 因子全库**（9原始列+45因子列=54列） | 3.3GB | `D:\quant_data\factor_daily.parquet` |
+| `ic_data.parquet` | IC 体检数据（因子+forward收益×4） | 1.4GB | `D:\quant_data\ic_data.parquet` |
+| `factor_bt.parquet` | 回测精简版（17列，含 limit_up_5d） | 497MB | `D:\quant_data\factor_bt.parquet` |
+| `factor_extra_daily.parquet` | 扩展5因子（ILLIQ/量价相关/偏度/峰度） | 512MB | `D:\quant_data\factor_extra_daily.parquet` |
+| `factor_daily_incr.parquet` | 每日增量因子（多文件scan合并读取） | 小 | `D:\quant_data\factor_daily_incr.parquet` |
+| `mined_factors_v2.csv` | 因子挖掘 v2 候选（612） | 36KB | `D:\quant_data\mined_factors_v2.csv` |
+| `mined_factors_v2_fine.csv` | 因子挖掘 v2 精算 Top 30 | 3.6KB | `D:\quant_data\mined_factors_v2_fine.csv` |
+| `llm_factors.csv` | LLM 因子合成输出（L1 生成引擎产物） | 小 | `D:\quant_data\llm_factors.csv` |
+| `ic_report.csv` | IC 体检报告 | 8.8KB | `D:\quant_data\ic_report.csv` |
+| `fdr_passed.csv` | FDR 校正通过名单 | 127KB | `D:\quant_data\fdr_passed.csv` |
+
+> 代码脚本在 `D:\quant_project\code\`，量化技能文档在 `D:\quant_project\skills\`。
 
 ---
 
 ## 一、库概况
-
 | 项目 | 值 |
 |------|-----|
 | 股票数量 | 4919 只（A股全量） |
@@ -141,46 +161,7 @@
 
 ---
 
-## 四、组合因子挖掘结果（2340 候选）
-
-**方法**（`mine_factors.py`）：40 个基础因子两两组合 × 3 种运算（x=相乘交互 / d=相减相对强弱 / p=相加）= C(40,2)×3 = **2340 候选**，逐一计算横截面 IC（fwd_20d 为主），结果存 `mined_factors.csv`。
-
-**性能要点**：41 列基础数据一次 collect 到内存（约 1.4GB）复用，避免每候选重复扫描 3.3GB 文件（否则 10+ 小时）；实测约 9s/候选，全程约 2 小时。
-
-### 12 个强因子（|IC|>0.03 且 |ICIR|>0.5）
-
-| 排名 | 组合因子 | IC 均值 | ICIR | 主题 |
-|------|----------|---------|------|------|
-| 1 | limit_down + is_suspended | -0.0303 | -0.65 | 跌停/停牌续跌 |
-| 2 | ma5_dist + turn_ma5 | -0.0787 | -0.57 | 偏离均线 × 高换手 |
-| 3 | ret_5d + turn_ma20 | -0.0738 | -0.55 | 涨多 × 高换手 |
-| 4 | ret_5d + turn_ma5 | -0.0721 | -0.54 | 涨多 × 高换手 |
-| 5 | ma5_dist + turn_ma20 | -0.0752 | -0.53 | 偏离均线 × 高换手 |
-| 6 | vol_10d + vol_change_5d | -0.0516 | -0.53 | 高波动 × 放量 |
-| 7 | vol_20d + vol_change_5d | -0.0516 | -0.53 | 高波动 × 放量 |
-| 8 | vol_20d + vol_ratio_20 | -0.0594 | -0.52 | 高波动 × 放量 |
-| 9 | vol_10d + vol_ratio_20 | -0.0559 | -0.52 | 高波动 × 放量 |
-| 10 | ma5_dist + atr_ratio | -0.0727 | -0.51 | 偏离均线 × 高波动 |
-| 11 | ma20_dist + turn_ma20 | -0.0748 | -0.51 | 偏离均线 × 高换手 |
-| 12 | vol_20d + vol_ratio_20（重复主题） | — | — | 高波动 × 放量 |
-
-**统一规则：「高换手 + 高波动 + 涨多 + 距均线远」= 未来下跌**（A股反转效应最强的组合形式），12 个强因子全部为负 IC 反转类。
-
----
-
-## 五、FDR 校正与因子冗余性（方法论教训）
-
-**方法**（`fdr.py`）：BH 校正，`t = ICIR×√days`，`p = 2×(1-Φ(|t|))`，`q = p×N/rank`。
-
-**结果**：2340 候选 → **1619 个通过 q<0.05**（占 69%）——几乎全过。
-
-**结论：组合因子高度冗余**。两两组合共享基础因子（如 vol_ratio_20 × 各种），IC 序列高度相关，t 统计量巨大（-16~-30），p 值全为 0。2340 个候选实际只有 **4-5 个独立主题**（放量×高换手、涨多×高换手、高波动×放量、跌停类）的重复。
-
-**教训**：组合生成的候选必须先按主题去相关（相关性矩阵/VIF），再谈多重检验校正，否则 FDR 形同虚设。因子池最终应保留 5-10 个低相关因子。
-
----
-
-## 六、因子在策略中的用途
+## 四、因子在策略中的用途
 
 ### v7 横截面打分（当前最优策略，+6.9%）
 
@@ -209,7 +190,7 @@ score = rank(-ret_5d×turn_ma5)   × 0.25   # 低换手+回调（反转）
 
 ---
 
-## 七、维护注意
+## 五、维护注意
 
 1. **因子公式唯一来源**：`factors.py` 的 `calc_factors()`，任何改动必须同步 `build_factors_pl.py` 与增量链路。
 2. **增量文件**：`factor_daily_incr.parquet` 定期（月度）用 sink 流式合并进大文件后删除；所有消费方必须走多文件 scan，漏读增量会静默用旧数据选股。
