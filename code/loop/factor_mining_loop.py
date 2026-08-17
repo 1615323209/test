@@ -57,6 +57,8 @@ def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None):
             continue
         cand2["status"] = "候选"
         cand2["added_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if cand2.get("archived_only"):
+            cand2["status"] = "档案"  # role != score：只登记档案，不进打分池、不触发 L3（L2 文档第七章）
         pool.append(cand2)
         pool_exprs.append({"expr": cand2["expr"], "expr_hash": cand2["expr_hash"], "name": cand2["name"]})
         added += 1

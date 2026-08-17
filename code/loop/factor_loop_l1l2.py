@@ -579,11 +579,22 @@ def parse_json(text):
 
 # ============ L2 主流程（单因子全管线） ============
 def l2_pipeline(cand, pool_exprs, api_key, df=None, verbose=True):
-    """候选因子过 L2 全管线。返回 (通过与否, 原因, 增强的cand)"""
+    """候选因子过 L2 全管线。返回 (通过与否, 原因, 增强的cand)
+    role 分流（L2 文档第二章）：score 走完整管线；exit/timing 只做去重+档案登记"""
     df = df if df is not None else load_design_df()  # L2 判定口径：设计段 2021-2023（L2 文档第三章）
     expr, serr = safe_compile(cand["expr"])
     if expr is None:
         return False, f"表达式沙箱拒绝: {serr}", cand
+    role = cand.get("role", "score")
+    if role != "score":
+        # exit/timing：只做语义/数值去重 + 档案登记（正交化/regime/半衰期是打分因子的概念）
+        ok, why = l2_dedup(cand["expr"], pool_exprs, df=df)
+        if not ok:
+            return False, f"去重: {why}", cand
+        cand["archived_only"] = True
+        if verbose:
+            print(f"    [L2] {cand['name']} role={role} 只登记档案（L3 评估形态未就绪）")
+        return True, "", cand
     # 1. 精算层（换手暴露；quintile 单调已上移 L1 G3，L2 不再重复）
     fine = l2_fine_eval(expr, df=df)
     if fine is None:

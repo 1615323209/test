@@ -71,9 +71,14 @@ def calc_factors(df):
     df=df.with_columns([mid.alias('bb_mid'),(mid+2*std).alias('bb_upper'),(mid-2*std).alias('bb_lower'),
         ((mid+2*std-(mid-2*std))/mid).alias('bb_width'),
         ((pl.col('收盘')-(mid-2*std))/(mid+2*std-(mid-2*std)+1e-10)).alias('bb_pos')])
-    df=df.with_columns([(pl.col('ret_1d')>0.095).cast(pl.Int32).alias('limit_up'),
-        (pl.col('ret_1d')<-0.095).cast(pl.Int32).alias('limit_down'),
-        (pl.col('成交量')==0).cast(pl.Int32).alias('is_suspended')])
+    # 涨跌停判定（L1 文档缺陷 16 修复）：创业板(30x)/科创板(68x) 20%阈值，其余 10%
+    # 留余量（19.5%/9.5%）防恰好涨停边界误判；ST 的 5% 需股票名标记，数据缺失暂用近似
+    th_up = (pl.when(pl.col('股票代码').str.starts_with('30')
+                     | pl.col('股票代码').str.starts_with('68'))
+             .then(0.195).otherwise(0.095))
+    df = df.with_columns([(pl.col('ret_1d') > th_up).cast(pl.Int32).alias('limit_up'),
+        (pl.col('ret_1d') < -th_up).cast(pl.Int32).alias('limit_down'),
+        (pl.col('成交量') == 0).cast(pl.Int32).alias('is_suspended')])
     # 连涨/连跌（add_streak 逻辑）
     up_flag = (pl.col('ret_1d') > 0).cast(pl.Int32)
     dn_flag = (pl.col('ret_1d') < 0).cast(pl.Int32)
