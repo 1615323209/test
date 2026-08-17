@@ -2,7 +2,7 @@
 
 > 更新时间：2026-08-16
 > 数据文件：`factor_daily.parquet`（3.3GB）+ `factor_daily_incr.parquet`（每日增量）—— **2026-08-16 起存于 Windows 本地 `D:\quant_data\`**
-> 构建脚本：`build_factors_pl.py`（全量，polars 分批）/ `factors.py`（因子计算模块，增量共用）
+> 构建脚本：`factors.py`（因子计算模块）+ `update_daily.py`（每日增量）
 > 因子挖掘历史与完整研究背景见 [策略版本日志.md](./策略版本日志.md)
 
 ---
@@ -41,7 +41,7 @@
 
 **9 个原始列**：日期、开盘、收盘、最高、最低、成交量、turnover（换手率）、成交额、股票代码
 
-**构建方式**：`build_factors_pl.py` 按 500 只/批切片 → 每批算因子写独立临时文件 → ParquetWriter 逐文件合并（2GB 内存机器防 OOM 的标准模式）。`factors.py` 为抽取出的公共计算模块，供 `update_daily.py` 每日增量复用，两处公式必须保持一致。
+**构建方式**：`factors.py` 为公共计算模块，`update_daily.py` 每日增量复用（新数据写 `factor_daily_incr.parquet`，不动 3.3GB 主文件，读取方多文件 scan）。
 
 **每日增量**：新交易日因子写入 `factor_daily_incr.parquet`（小文件，直接 concat），所有读取方用多文件 `scan_parquet([factor_daily, factor_daily_incr])` 合并读取，不动 3.3GB 大文件（避免 OOM）。
 
@@ -186,13 +186,13 @@ score = rank(-ret_5d×turn_ma5)   × 0.25   # 低换手+回调（反转）
 
 ### 模拟盘
 
-`daily_picks.py` / `paper_trading.py`：每日按 v7 打分输出清单并模拟交易，读取方统一走多文件 scan（factor_daily + factor_daily_incr）。
+`daily_picks.py` / `live_positions.py`：每日按 v7 打分输出实盘候选并跟踪真实持仓（L4 实盘手动模式），读取方统一走多文件 scan（factor_daily + factor_daily_incr）。
 
 ---
 
 ## 五、维护注意
 
-1. **因子公式唯一来源**：`factors.py` 的 `calc_factors()`，任何改动必须同步 `build_factors_pl.py` 与增量链路。
+1. **因子公式唯一来源**：`factors.py` 的 `calc_factors()`，任何改动必须同步增量链路（`update_daily.py`）。
 2. **增量文件**：`factor_daily_incr.parquet` 定期（月度）用 sink 流式合并进大文件后删除；所有消费方必须走多文件 scan，漏读增量会静默用旧数据选股。
 3. **已知 polars 坑**：`min_periods` 已改名 `min_samples`；spearman corr 的 NaN 需 `fill_nan(None).drop_nulls()`；单日 rolling 窗口不足全 null（选股脚本需先加载目标日前 5 个交易日）。
 4. **回测哑火防护**：固定仓位（现金<1万即永久空仓）是历史教训，回测与模拟盘均用动态仓位。

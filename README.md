@@ -45,29 +45,25 @@ D:\quant_data\                      # 数据（全部本地化）
     ├── backtest_history.csv        # L3 回测历史
     └── data_health.json            # 数据健康扫描
 
-D:\quant_project\code\              # 代码（按四层架构 + 功能分层）
-├── loop\                           # 四层 loop 核心（宪法 L1-L4）
+D:\quant_project\code\              # 代码（按四层架构 + 功能分层，仅保留 loop 必需）
+├── loop\                           # 四层 loop 核心（宪法 L1-L4）★重点维护
 │   ├── factor_mining_loop.py       # ★ 总控入口
 │   ├── factor_loop_infra.py        # 工程保障（检查点/锁/事件/健康扫描）
 │   ├── factor_loop_l1l2.py         # L1+L2 管线
 │   ├── factor_loop_l3l4.py         # L3+L4 + 权重 + dashboard
 │   ├── llm_factor_synth.py         # LLM 因子合成（L1 生成引擎）
 │   └── run_loop_cron.py            # cron 包装（纯Python）
-├── backtest\                       # L3 回测引擎与研究
-│   ├── backtest_engine.py          # 回测引擎（L3 唯一入口）
-│   ├── walk_forward_v7.py          # 滚动回测
-│   └── validation.py / sensitivity.py / freq_test.py
-├── factors\                        # L1/L2 因子构建与研究
-│   ├── factors.py / extra_factors.py  # 因子计算
-│   ├── build_extra_factors.py / build_factors_pl.py  # 因子库构建
-│   ├── ic_step1.py / ic_step2.py / ic_extra.py  # IC 体检
-│   ├── fdr.py / quintile_test.py   # 多重检验 / 分层验证
-│   └── mine_factors*.py / attribution.py
-├── paper\                          # L4 实盘/模拟盘
-│   ├── daily_picks.py / paper_trading.py
-│   └── update_daily.py / update_hs300.py
+├── backtest\                       # L3 回测引擎
+│   └── backtest_engine.py          # 回测引擎（L3 唯一入口）
+├── factors\                        # 因子计算（数据管线）
+│   ├── factors.py                  # 45 因子计算（calc_factors）
+│   └── extra_factors.py            # 扩展因子（5个）
+├── paper\                          # L4 实盘（手动跟踪）
+│   ├── daily_picks.py              # v7 打分选股（实盘候选）
+│   ├── live_positions.py           # 真实持仓管理（--add/--sell/--status）
+│   └── update_daily.py / update_hs300.py  # 每日数据更新
 ├── data\                           # 数据采集
-│   └── collect_hfq.py / tx_collect.py / build_market.py / extract_bt_cols.py
+│   └── tx_collect.py               # 腾讯日K采集（update_daily 依赖）
 └── _archive\                       # 历史版本/一次性脚本（归档不删）
 
 D:\quant_project\docs\              # 量化架构文档（入库）
@@ -83,15 +79,15 @@ D:\quant_project\skills\            # 量化技能文档
 
 | 脚本 | 用途 | 输出 |
 |------|------|------|
-| `mine_factors.py` | v1 挖掘：C(40,2)×3 组合 IC（历史） | mined_factors.csv |
-| `fdr.py` | BH 多重检验校正（历史） | fdr_passed.csv |
-| `mine_factors_v2.py` | v2 挖掘：预去相关+4运算（历史） | mined_factors_v2.csv |
-| `resume_fine_v2.py` | v2 精算层续跑（历史，本地版） | mined_factors_v2_fine.csv |
-| `llm_factor_synth.py` | ★L1 生成：DeepSeek 因子合成 | llm_factors.csv |
-| `ic_step1.py` / `ic_step2.py` | 单因子 IC 体检 | ic_report.csv |
-| `quintile_test.py` | quintile 分层验证 | — |
-| `backtest_engine.py` | ★L3 回测（可注入因子+分年段） | 指标 dict |
-| `daily_picks.py` / `paper_trading.py` | ★L4 模拟盘 | picks/paper_trades.csv |
+| `loop/factor_mining_loop.py` | ★四层 loop 总控 | 因子池/检查点 |
+| `loop/llm_factor_synth.py` | ★L1 生成：DeepSeek 因子合成 | llm_factors.csv |
+| `loop/factor_loop_l1l2.py` | L1+L2 管线（精炼+筛选） | l1_log/l2_log.csv |
+| `loop/factor_loop_l3l4.py` | L3+L4（回测评估+实盘验证） | backtest_history/l4_log.csv |
+| `backtest/backtest_engine.py` | ★L3 回测（可注入因子+分年段） | 指标 dict |
+| `paper/daily_picks.py` | ★L4 实盘选股（v7 打分） | daily_picks/picks_*.csv |
+| `paper/live_positions.py` | L4 真实持仓管理 | live_positions.json |
+| `paper/update_daily.py` | 每日数据更新（行情+因子+市场情绪） | factor_daily_incr.parquet |
+| `paper/update_hs300.py` | 沪深300 更新 | hs300.parquet |
 
 **待建脚本**（三大前沿方向，见 L1 文档第八章）：`build_alpha360_tensor.py` / `train_alpha360.py` / `formula_beam_search.py`
 
