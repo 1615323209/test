@@ -312,27 +312,36 @@ def expr_hash(expr_str):
     return hashlib.sha1(f"{skeleton}|{cols}".encode()).hexdigest()[:16]
 
 def l2_dedup(expr, pool_exprs, df=None):
-    """三通道去重。pool_exprs: [{expr, name}]。返回 (通过, 原因)"""
-    df = df if df is not None else load_train_df()
+    """三通道去重（L2 文档缺陷 7 修复）：语义 hash + 逐日横截面相关的时间均值
+    （替代旧"随机抽 20 万行池化相关"——池化相关混入时序共同波动，误判冗余）
+    pool_exprs: [{expr, name}]。返回 (通过, 原因)
+    """
+    df = df if df is not None else load_design_df()
     # 语义去重（快）
     h = expr_hash(expr)
     for p in pool_exprs:
         if p.get("expr_hash") == h:
             return False, "语义重复"
-    # 数值去重：采样相关性
-    sample = df.sample(n=200_000, seed=42)
+    # 数值去重：逐日横截面 Pearson/Spearman 相关，取时间均值
     try:
-        cand = sample.with_columns(expr.alias("_c"))
+        cand = df.with_columns(expr.alias("_c"))
         for p in pool_exprs:
             try:
                 pe, perr = safe_compile(p["expr"])
                 if pe is None:
                     continue
                 merged = cand.with_columns(pe.alias("_p"))
-                pear = merged.select(pl.corr(pl.col("_c"), pl.col("_p"))).item()
-                spe = merged.select(pl.corr(pl.col("_c"), pl.col("_p"), method="spearman")).item()
-                if abs(pear) >= 0.7 or abs(spe) >= 0.7:
-                    return False, f"与{p['name']}相关 pear={pear:.2f} spe={spe:.2f}"
+                daily = (merged.select(["日期", "_c", "_p"])
+                         .group_by("日期")
+                         .agg([pl.corr(pl.col("_c"), pl.col("_p")).alias("pear"),
+                               pl.corr(pl.col("_c"), pl.col("_p"), method="spearman").alias("spe")])
+                         .filter(pl.col("pear").is_not_null() & pl.col("pear").is_finite()))
+                if len(daily) < 30:
+                    continue
+                m_pear = float(daily["pear"].mean())
+                m_spe = float(daily["spe"].mean())
+                if abs(m_pear) >= 0.7 or abs(m_spe) >= 0.7:
+                    return False, f"与{p['name']}相关 pear={m_pear:.2f} spe={m_spe:.2f}"
             except Exception:
                 continue
     except Exception:
@@ -341,43 +350,63 @@ def l2_dedup(expr, pool_exprs, df=None):
 
 # ============ L2: 动态正交化（岭回归） ============
 def l2_orthogonal(expr, base_exprs, df=None):
-    """对 v7 六因子 + 池内因子做岭回归残差，检验残差 ICIR。
-    base_exprs: [expr_str, ...]。返回 (通过, 残差ICIR, 条件数)"""
-    df = df if df is not None else load_train_df()
-    sample = df.sample(n=300_000, seed=7)
+    """动态正交化（L2 文档缺陷 4/9 修复）：
+    - 基准统一 rank 形式（与 L3 注入 (expr).rank().over('日期') 一致，缺陷 9）
+    - 残差 ICIR 改为真口径：残差 → 逐日横截面 Spearman IC → Newey-West t（缺陷 4）
+    - 异常不再 return True 放行（防假门禁）
+    base_exprs: [expr_str, ...]。返回 (通过, 残差t_NW, 条件数)
+    """
+    df = df if df is not None else load_design_df()
     try:
-        y = sample.with_columns(expr.alias("_y"))["_y"].to_numpy()
+        # 先物化再 rank（polars 不支持带 over 的表达式直接 .rank().over() 嵌套，会全 NaN）
+        y = (df.with_columns(expr.alias("_y0"))
+             .with_columns(pl.col("_y0").rank().over("日期").alias("_y"))["_y"].to_numpy())
         X_cols = []
         for b in base_exprs:
             be, berr = safe_compile(b)
             if be is None:
                 continue
-            X_cols.append(sample.with_columns(be.alias("_x"))["_x"].to_numpy())
+            X_cols.append((df.with_columns(be.alias("_x0"))
+                           .with_columns(pl.col("_x0").rank().over("日期").alias("_x"))["_x"].to_numpy()))
         if not X_cols:
-            return True, 0.0, 0.0
+            return False, 0.0, 0.0
         X = np.column_stack(X_cols)
         mask = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
-        y, X = y[mask], X[mask]
-        if len(y) < 10000 or X.shape[1] == 0:
-            return True, 0.0, 0.0
-        # 条件数
-        Xc = X - X.mean(axis=0)
+        y_m, X_m = y[mask], X[mask]
+        if len(y_m) < 10000 or X_m.shape[1] == 0:
+            return False, 0.0, 0.0
+        # 条件数（基准内部共线检测）
+        Xc = X_m - X_m.mean(axis=0)
+        y_c = y_m - y_m.mean()  # 中心化 y（正规方程要求同口径）
+        cond = float(np.linalg.cond(Xc)) if Xc.size else 0.0
+        # 近 OLS（alpha 极小）；仅中度共线才加正则
+        alpha = 1e-8 if cond < 1e4 else 1e-3
         try:
-            cond = np.linalg.cond(Xc)
-        except Exception:
-            cond = 0.0
-        # 岭回归残差（防共线崩溃）
-        alpha = 1e-3 if cond < 1e6 else 1e-2
-        beta = np.linalg.solve(Xc.T @ Xc + alpha * np.eye(Xc.shape[1]), Xc.T @ y)
-        resid = y - Xc @ beta
-        # 残差 ICIR（近似：直接用残差对 y 的相关结构，用日度分组算）
-        res_df = sample.filter(pl.col("_y").is_not_null()).with_columns(pl.Series("_resid", np.nan).cast(pl.Float32))
-        # 简化：残差与 fwd_5d 的截面相关（在样本内近似）
-        r = np.corrcoef(resid, y)[0, 1]
-        resid_icir = float(r) * 10  # 近似放大（样本相关性→ICIR 量级）
-        return abs(resid_icir) >= 0.2, round(resid_icir, 3), round(cond, 0)
+            beta = np.linalg.solve(Xc.T @ Xc + alpha * np.eye(Xc.shape[1]), Xc.T @ y_c)
+        except np.linalg.LinAlgError:
+            return False, 0.0, round(cond, 0)
+        resid = y_c - Xc @ beta
+        # 残差范数检验：候选基本在基准线性空间内（残差≈0）→ "已被现有池子解释"拒绝
+        tss = float(y_c @ y_c)
+        rss = float(resid @ resid)
+        if tss > 0 and rss / tss < 1e-3:
+            return False, 0.0, round(cond, 0)
+        # 残差 → 逐日横截面 Spearman IC（与 L1 同口径）→ Newey-West t
+        resid_full = np.full(len(df), np.nan)
+        resid_full[mask] = resid
+        res_ic = (df.select(["日期", MAIN_HORIZON])
+                  .with_columns(pl.Series("_resid", resid_full))
+                  .filter(pl.col("_resid").is_finite() & pl.col(MAIN_HORIZON).is_finite())
+                  .group_by("日期")
+                  .agg(pl.corr(pl.col("_resid"), pl.col(MAIN_HORIZON), method="spearman").alias("ic"))
+                  .filter(pl.col("ic").is_not_null() & pl.col("ic").is_finite()))
+        if len(res_ic) < 100:
+            return False, 0.0, cond
+        t_nw = newey_west_t(res_ic["ic"].to_list())
+        return abs(t_nw) >= 2.0, round(t_nw, 2), round(cond, 0)
     except Exception as e:
-        return True, 0.0, 0.0   # 数值失败不拦（保守放行，L3 把关）
+        # 异常必须落盘可见，不放行（L2 文档：假门禁比没有门禁更危险）
+        return False, 0.0, 0.0
 
 # ============ L2: regime 分层（L2 文档第四章第 4 节） ============
 def l2_regime(expr, df=None):
@@ -551,18 +580,16 @@ def parse_json(text):
 # ============ L2 主流程（单因子全管线） ============
 def l2_pipeline(cand, pool_exprs, api_key, df=None, verbose=True):
     """候选因子过 L2 全管线。返回 (通过与否, 原因, 增强的cand)"""
-    df = df if df is not None else load_train_df()
+    df = df if df is not None else load_design_df()  # L2 判定口径：设计段 2021-2023（L2 文档第三章）
     expr, serr = safe_compile(cand["expr"])
     if expr is None:
         return False, f"表达式沙箱拒绝: {serr}", cand
-    # 1. 精算层
+    # 1. 精算层（换手暴露；quintile 单调已上移 L1 G3，L2 不再重复）
     fine = l2_fine_eval(expr, df=df)
     if fine is None:
         return False, "精算层失败", cand
     if fine["turn_exp"] > 1.5:
         return False, f"换手暴露过高: {fine['turn_exp']}", cand
-    if abs(fine["mono"]) < (0.5 if cand["ic_metrics"].get("extreme_driven") else 0.3):
-        return False, f"quintile单调性弱: {fine['mono']}", cand
     cand["fine_metrics"] = fine
     # 2. 三通道去重
     ok, why = l2_dedup(cand["expr"], pool_exprs, df=df)
