@@ -4,14 +4,16 @@ import pandas as pd
 from pathlib import Path
 
 FACTOR = Path("D:/quant_data/factor_daily.parquet")
+FACTOR_INCR = Path("D:/quant_data/factor_daily_incr.parquet")
 NORTH = Path("D:/quant_data/north_fund_flow.parquet")
 OUT = Path("D:/quant_data/market_daily.parquet")
 
 print("=== 市场情绪因子 ===")
 
-# 1. 从因子库聚合每日市场统计
+# 1. 从因子库聚合每日市场统计（主文件 + 增量文件，多文件 scan 自动统一 schema）
 print("[1] 聚合每日涨跌家数/涨停数...")
-lf = pl.scan_parquet(FACTOR)
+files = [FACTOR] + ([FACTOR_INCR] if FACTOR_INCR.exists() else [])
+lf = pl.scan_parquet(files)
 market = lf.group_by('日期').agg([
     pl.col('股票代码').n_unique().alias('股票数'),
     pl.col('limit_up').sum().alias('涨停家数'),
@@ -61,4 +63,4 @@ result.write_parquet(OUT)
 print(f"\n=== 完成 ===")
 print(f"输出: {OUT} ({OUT.stat().st_size/1024/1024:.0f}KB)")
 print(f"行数: {len(result)}, 列: {result.columns}")
-print(result.tail(3).to_string())
+print(result.tail(3))
