@@ -89,7 +89,7 @@ D:\quant_project\skills\            # 量化技能文档
 | `paper/update_daily.py` | 每日数据更新（行情+因子+市场情绪） | factor_daily_incr.parquet |
 | `paper/update_hs300.py` | 沪深300 更新 | hs300.parquet |
 
-**待建脚本**（三大前沿方向，见 L1 文档第八章）：`build_alpha360_tensor.py` / `train_alpha360.py` / `formula_beam_search.py`
+**L1 生成引擎**（三大方向，见 L1 文档第八章）：`loop/llm_factor_synth.py`（方向一·LLM合成）/ `loop/formula_beam_search.py`（方向三·公式束搜索）/ `loop/build_alpha360_tensor.py` + `loop/train_alpha360.py`（方向二·Alpha360 深度学习）
 
 ---
 
