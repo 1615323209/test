@@ -55,13 +55,15 @@ def main():
     args = ap.parse_args()
 
     t0 = time.time()
-    print("=== Alpha360 训练 ===")
+    print("=== Alpha360 训练（PIT 严格版） ===")
     print(f"[1/4] 加载数据...")
-    tx = np.load(OUT / "train_x.npy"); ty = np.load(OUT / "train_y.npy")
-    vx = np.load(OUT / "val_x.npy"); vy = np.load(OUT / "val_y.npy")
-    tm = json.load(open(OUT / "train_meta.json"))
-    vm = json.load(open(OUT / "val_meta.json"))
-    print(f"  train {tx.shape} val {vx.shape} ({time.time()-t0:.0f}s)")
+    # 设计段训练 / 2024 内层留出验证（early stopping 基准）
+    # 2025-2026 真验证集只在 L3 复核时用，禁止参与训练与选模（L1 文档第六章第 6 条）
+    tx = np.load(OUT / "design_x.npy"); ty = np.load(OUT / "design_y.npy")
+    vx = np.load(OUT / "holdout_x.npy"); vy = np.load(OUT / "holdout_y.npy")
+    tm = json.load(open(OUT / "design_meta.json"))
+    vm = json.load(open(OUT / "holdout_meta.json"))
+    print(f"  design {tx.shape} holdout {vx.shape} ({time.time()-t0:.0f}s)")
 
     train_dl = DataLoader(TensorDataset(torch.tensor(tx), torch.tensor(ty)),
                           batch_size=args.batch, shuffle=True)
@@ -105,17 +107,25 @@ def main():
         model.load_state_dict(best_state)
     torch.save(model.state_dict(), OUT / "alpha360_model.pt")
 
-    print(f"[4/4] 输出全样本预测...")
+    print(f"[4/4] 输出三段预测（design/holdout/valid；valid 只推理，L3 复核用）...")
     model.eval()
     with torch.no_grad():
-        tp = torch.cat([model(xb) for xb, _ in train_dl]).numpy()
-        vp = torch.cat([model(xb) for xb, _ in val_dl]).numpy()
-    tr = pd.DataFrame({"日期": tm["dates"], "股票代码": tm["codes"], "alpha360": tp})
-    va = pd.DataFrame({"日期": vm["dates"], "股票代码": vm["codes"], "alpha360": vp})
-    tr.to_csv(OUT / "pred_train.csv", index=False)
-    va.to_csv(OUT / "pred_val.csv", index=False)
-    v_ic, v_icir, vn = daily_ic(vp, vy, vm["dates"])
-    print(f"=== 完成 {time.time()-t0:.0f}s | val 最终 IC={v_ic:+.4f} ICIR={v_icir:+.3f} ({vn}天) ===")
+        dp = torch.cat([model(xb) for xb, _ in train_dl]).numpy()
+        hp = torch.cat([model(xb) for xb, _ in val_dl]).numpy()
+        # 真验证集 2025-2026：只推理，不参与训练/early stopping/选模
+        vx2 = np.load(OUT / "valid_x.npy")
+        vm2 = json.load(open(OUT / "valid_meta.json"))
+        valid_dl = DataLoader(TensorDataset(torch.tensor(vx2), torch.zeros(len(vx2))),
+                              batch_size=args.batch, shuffle=False)
+        vp = torch.cat([model(xb) for xb, _ in valid_dl]).numpy()
+    tr = pd.DataFrame({"日期": tm["dates"], "股票代码": tm["codes"], "alpha360": dp})
+    ho = pd.DataFrame({"日期": vm["dates"], "股票代码": vm["codes"], "alpha360": hp})
+    va = pd.DataFrame({"日期": vm2["dates"], "股票代码": vm2["codes"], "alpha360": vp})
+    tr.to_csv(OUT / "pred_design.csv", index=False)
+    ho.to_csv(OUT / "pred_holdout.csv", index=False)
+    va.to_csv(OUT / "pred_valid.csv", index=False)
+    h_ic, h_icir, hn = daily_ic(hp, vy, vm["dates"])
+    print(f"=== 完成 {time.time()-t0:.0f}s | holdout(2024) IC={h_ic:+.4f} ICIR={h_icir:+.3f} ({hn}天) ===")
 
 if __name__ == "__main__":
     main()

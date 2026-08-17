@@ -23,6 +23,8 @@ OUT = DATA / "alpha360"
 WINDOW = 30
 FCOLS = ['收盘', '开盘', '最高', '最低', '成交量', '成交额', 'turnover']
 TRAIN_LO, TRAIN_HI = date(2021, 1, 1), date(2024, 12, 31)
+DESIGN_LO, DESIGN_HI = date(2021, 1, 1), date(2023, 12, 31)
+HOLDOUT_LO, HOLDOUT_HI = date(2024, 1, 1), date(2024, 12, 31)
 VAL_LO, VAL_HI = date(2025, 1, 1), date(2026, 12, 31)
 
 def main():
@@ -75,8 +77,10 @@ def main():
 
     # 3. 按股票滑窗
     print("[3/4] 滑窗构建张量...")
-    train_x, train_y, train_meta = [], [], []
-    val_x, val_y, val_meta = [], [], []
+    # 三段切分（train_alpha360 泄漏修复：设计段训练/2024内层验证/2025-2026真验证）
+    design_x, design_y, design_meta = [], [], []
+    holdout_x, holdout_y, holdout_meta = [], [], []
+    valid_x, valid_y, valid_meta = [], [], []
     n_stocks = d['股票代码'].n_unique()
 
     for i, (code, g) in enumerate(d.group_by('股票代码', maintain_order=True)):
@@ -96,12 +100,14 @@ def main():
             if not np.isfinite(yw[j]):
                 continue
             xx = np.nan_to_num(xw[j], nan=0.0).astype(np.float32)
-            if TRAIN_LO <= dt <= TRAIN_HI:
-                train_x.append(xx); train_y.append(yw[j]); train_meta.append((dt.isoformat(), code))
+            if DESIGN_LO <= dt <= DESIGN_HI:
+                design_x.append(xx); design_y.append(yw[j]); design_meta.append((dt.isoformat(), code))
+            elif HOLDOUT_LO <= dt <= HOLDOUT_HI:
+                holdout_x.append(xx); holdout_y.append(yw[j]); holdout_meta.append((dt.isoformat(), code))
             elif VAL_LO <= dt <= VAL_HI:
-                val_x.append(xx); val_y.append(yw[j]); val_meta.append((dt.isoformat(), code))
+                valid_x.append(xx); valid_y.append(yw[j]); valid_meta.append((dt.isoformat(), code))
         if (i + 1) % 1000 == 0:
-            print(f"  {i+1}/{n_stocks} 只完成, train={len(train_y)}, val={len(val_y)}, {time.time()-t0:.0f}s")
+            print(f"  {i+1}/{n_stocks} 只完成, design={len(design_y)}, holdout={len(holdout_y)}, valid={len(valid_y)}, {time.time()-t0:.0f}s")
 
     # 4. 写盘
     print("[4/4] 写盘...")
@@ -115,8 +121,9 @@ def main():
                         "features": feats, "window": WINDOW}, ensure_ascii=False), encoding="utf-8")
         print(f"  {prefix}: x{x.shape} y{y.shape} {len(meta)}样本")
 
-    save("train", train_x, train_y, train_meta)
-    save("val", val_x, val_y, val_meta)
+    save("design", design_x, design_y, design_meta)
+    save("holdout", holdout_x, holdout_y, holdout_meta)
+    save("valid", valid_x, valid_y, valid_meta)
     print(f"=== 完成 {time.time()-t0:.0f}s ===")
 
 if __name__ == "__main__":
