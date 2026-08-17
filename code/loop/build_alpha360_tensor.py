@@ -48,13 +48,14 @@ def main():
     # 2. 特征工程（按股票）
     print("[2/4] 特征工程（z-score + ret_1d + fwd_5d）...")
     if args.pit_stats:
-        # PIT 严格版：z-score 用训练期统计（只到 2024-12-31），防止验证期信息泄漏进特征
-        print("  PIT 严格版：z-score 用训练期(<=2024-12-31)统计")
+        # PIT 严格版：z-score 只用设计段(<=2023-12-31)统计——防 2024 holdout 特征沾自身统计
+        # （第一版误用 TRAIN_HI=2024-12-31，2024 特征仍含 holdout 自身 mean/std）
+        print("  PIT 严格版：z-score 用设计段(<=2023-12-31)统计")
         stat_exprs = []
         for c in FCOLS:
             stat_exprs.append(pl.col(c).mean().alias(f'{c}_m'))
             stat_exprs.append(pl.col(c).std().alias(f'{c}_s'))
-        stat = (df.filter(pl.col('日期') <= TRAIN_HI)
+        stat = (df.filter(pl.col('日期') <= DESIGN_HI)
                 .group_by('股票代码')
                 .agg(stat_exprs))
         d = df.join(stat, on='股票代码', how='left')
