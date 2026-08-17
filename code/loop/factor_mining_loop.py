@@ -119,23 +119,45 @@ def run_l3(ck, verbose=True):
     return n_enabled
 
 def run_l4(ck, paper_file=None, verbose=True):
-    """L4 实盘验证评估（模拟盘数据驱动）"""
+    """L4 实盘验证评估（真实成交驱动；L4 文档缺陷 3 修复：不再默认读模拟盘 paper_trades.csv）"""
     pool = ck["pool"]
-    paper_file = paper_file or (DATA_DIR / "paper_trades.csv")
-    trades = []
-    if paper_file.exists():
+    trades, src = [], "none"
+    live_trades = DATA_DIR / "live_trades.csv"
+    if paper_file:
         import csv
         with open(paper_file, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                trades.append(row)
+            trades = list(csv.DictReader(f))
+        src = str(paper_file)
+    elif live_trades.exists():
+        import csv
+        with open(live_trades, newline="", encoding="utf-8") as f:
+            trades = list(csv.DictReader(f))
+        src = "live_trades.csv(真实成交)"
+    else:
+        # 无成交记录：读真实持仓（仅登记状态，不做 SPRT 判定）
+        lp = DATA_DIR / "live_positions.json"
+        if lp.exists():
+            try:
+                pos = json.loads(lp.read_text(encoding="utf-8"))
+                src = f"live_positions.json({len(pos)}只持仓, 暂无成交记录)"
+            except Exception:
+                pos = []
+                src = "live_positions.json(读取失败)"
     enabled = [p for p in pool if p["status"] in ("启用", "实盘确认", "观察")]
     from factor_loop_l3l4 import l4_evaluate
     for p in enabled:
         ft = [t for t in trades if t.get("factor") == p["name"]]
-        status, rep = l4_evaluate(p, ft, verbose=verbose)
+        if not ft:
+            # 无该因子成交记录：登记观察，不判定
+            rep = {"n": 0, "reason": f"无真实成交记录 (数据源: {src})"}
+        else:
+            status, rep = l4_evaluate(p, ft, verbose=verbose)
         rep["name"] = p["name"]
         rep["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        rep["data_src"] = src
         append_csv(STATE_DIR / "l4_log.csv", {**rep, "ts": rep["ts"]})
+        if rep.get("n", 0) == 0:
+            continue
         if status == "实盘确认":
             p["status"] = "实盘确认"
         elif status == "回滚":

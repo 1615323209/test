@@ -24,17 +24,22 @@ BASELINE = {
 
 # ============ L3: 权重计算（含总权重约束与迭代剔除） ============
 def calc_weights(pool):
-    """pool: 启用因子列表 [{name, icir, half_life}]。返回 {name: weight}（缩放后）"""
+    """pool: 启用因子列表 [{name, icir, half_life}]。返回 {name: weight}（缩放后）
+    L3 文档第四章修正：
+    - ICIR 优先用可交易域口径 icir_tradable（缺陷 3，全域 ICIR 含不可买样本假 alpha）
+    - half_life_unknown 按 short_lived 保守处理，封顶 0.04（缺陷 L3-4）
+    """
     if not pool:
         return {}
-    ics = [abs(p["icir"]) for p in pool]
+    ics = [abs(p.get("icir_tradable") or p["icir"]) for p in pool]
     med = float(np.median(ics)) if ics else 0.05
     weights = {}
     for p in pool:
-        w = 0.05 * abs(p["icir"]) / max(med, 1e-6)
+        icir = abs(p.get("icir_tradable") or p["icir"])
+        w = 0.05 * icir / max(med, 1e-6)
         w = min(w, 0.10)                        # 封顶
-        if p.get("short_lived"):
-            w = min(w, 0.04)                    # 短寿命截断法封顶 0.04，不保下限
+        if p.get("short_lived") or p.get("half_life_unknown"):
+            w = min(w, 0.04)                    # 短寿命/未知寿命截断法封顶 0.04，不保下限
         else:
             w = max(w, 0.02)                    # 下限（仅正常因子）
         weights[p["name"]] = w
@@ -72,14 +77,24 @@ def l3_evaluate(cand, cumulative_tested, extra_factors=None, verbose=True):
     train_m = run_backtest(extra_factors=injected, start_year=2021, end_year=2024, verbose=False)
     # 验证集回测
     valid_m = run_backtest(extra_factors=injected, start_year=2025, end_year=2026, verbose=False)
-    N = cumulative_tested + 1
+    # N = Σn_peek（L3 文档缺陷 2：旧口径按候选个数累加，低估修正轮窥视次数）
+    N = cumulative_tested + cand.get("n_peek", 1)
     thr = dynamic_threshold(N)
     train_gain = train_m["total_ret_pct"] - BASELINE["train"]["total_ret_pct"]
     valid_gain = valid_m["total_ret_pct"] - BASELINE["valid"]["total_ret_pct"]
+    # 分段披露（L3 文档缺陷 4）：2021-2023 设计段 / 2024 内层留出（已被 L1 消费）
+    seg_design = run_backtest(extra_factors=injected, start_year=2021, end_year=2023, verbose=False)
+    seg_2024 = run_backtest(extra_factors=injected, start_year=2024, end_year=2024, verbose=False)
     report = {
-        "name": name, "N": N, "threshold": round(thr, 3),
+        "name": name, "N": N, "N_effective": N, "threshold": round(thr, 3),
         "train": train_m, "valid": valid_m,
         "train_gain": round(train_gain, 2), "valid_gain": round(valid_gain, 2),
+        "seg": {
+            "design_2021_2023": round(seg_design["total_ret_pct"], 2),
+            "holdout_2024": round(seg_2024["total_ret_pct"], 2),
+            "valid_2025_2026": round(valid_m["total_ret_pct"], 2),
+            "note": "2024 已被 L1 用作 G4 内层留出，非独立 OOS",
+        },
     }
     # 判定
     if train_gain >= thr:
@@ -132,8 +147,8 @@ def l4_evaluate(factor, paper_trades, sigma_prior=None, verbose=True):
     name = factor["name"]
     rets = [t.get("pnl_pct", 0) for t in paper_trades if t.get("factor") == name]
     n = len(rets)
-    # 样本分级
-    short_lived = factor.get("short_lived", False)
+    # 样本分级（L4 文档缺陷 2：half_life_unknown 按短寿命保守处理，10 交易日+5 笔）
+    short_lived = factor.get("short_lived", False) or factor.get("half_life_unknown", False)
     min_n = 5 if short_lived else 10
     if n < 5:
         return "观察", {"n": n, "reason": "样本不足(早期预警线未到)"}

@@ -7,12 +7,13 @@
 规则（用户实盘策略）: 最多2只 / 单票<=1万 / 止损-5% / 止盈+12%
 文件: D:/quant_data/live_positions.json
 """
-import json, sys, argparse
+import json, sys, argparse, csv
 from pathlib import Path
 from datetime import date
 
 DATA = Path("D:/quant_data")
 STATE = DATA / "live_positions.json"
+TRADES = DATA / "live_trades.csv"
 
 MAX_POSITIONS = 2
 MAX_AMOUNT = 10000.0
@@ -78,26 +79,47 @@ def cmd_add(args):
     print(f"当前 {len(pos)}/{MAX_POSITIONS} 只，剩余仓位 {MAX_POSITIONS*MAX_AMOUNT - sum(p['amount'] for p in pos):.0f} 元")
     return 0
 
+def record_trade(code, cost, price, shares, d):
+    """记录真实成交到 live_trades.csv（L4 SPRT 数据源，L4 文档缺陷 3 配套）"""
+    pnl_pct = (price - cost) / cost
+    new = not TRADES.exists()
+    with open(TRADES, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["date", "code", "cost", "price", "shares", "pnl_pct", "factor"])
+        w.writerow([d, code, cost, price, shares, round(pnl_pct, 4), ""])
+    return pnl_pct
+
 def cmd_sell(args):
     pos = load()
     code = args.sell[0]
     d = args.sell[2] if len(args.sell) > 2 else str(date.today())
+    price = float(args.sell[3]) if len(args.sell) > 3 else None  # 可选：卖出价（记录成交用）
     p = next((x for x in pos if x["code"] == code), None)
     if not p:
         print(f"未找到持仓 {code}。")
         return 1
+    sold_shares = 0
     if len(args.sell) > 1 and args.sell[1] != "all":
         shares = int(args.sell[1])
         if shares >= p["shares"]:
+            sold_shares = p["shares"]
             pos.remove(p)
             print(f"已清仓 {code}（{d}）。")
         else:
+            sold_shares = shares
             p["shares"] -= shares
             p["amount"] = p["cost"] * p["shares"]
             print(f"已卖出 {code} {shares}股，剩余 {p['shares']}股（{d}）。")
     else:
+        sold_shares = p["shares"]
         pos.remove(p)
         print(f"已清仓 {code}（{d}）。")
+    if price and sold_shares > 0:
+        pnl = record_trade(code, p["cost"], price, sold_shares, d)
+        print(f"已记录成交: {code} 成本{p['cost']:.2f}→卖{price:.2f} 盈亏{pnl:+.2%}")
+    else:
+        print(f"（未提供卖出价，未记录成交；可在盘中监控时补记）")
     save(pos)
     return 0
 
