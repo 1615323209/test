@@ -8,9 +8,14 @@ from pathlib import Path
 CODE = Path(r"D:\quant_project\code")
 PY = r"D:\02_download\APP\Anaconda\python.exe"
 
-def run(cmd):
-    r = subprocess.run(cmd, cwd=str(CODE), capture_output=True, text=True, encoding="utf-8", errors="replace")
-    return r
+def run(cmd, timeout=540):
+    """子进程超时保护（cron 总预算 600s，子任务留余量）"""
+    try:
+        r = subprocess.run(cmd, cwd=str(CODE), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        return r
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, stdout="", stderr="子进程超时")
 
 # 跑一批
 r1 = run([PY, "-m", "loop.factor_mining_loop", "--batch", "1"])
