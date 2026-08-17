@@ -102,7 +102,7 @@ def score_all(cands, top_k, verbose=True):
             scored.append(r)
         if verbose and (i + 1) % 50 == 0:
             print(f"  已打分 {i+1}/{len(cands)}，有效 {len(scored)}，过L1 {sum(1 for x in scored if x['l1_ok'])}")
-    scored.sort(key=lambda x: (x["l1_ok"], abs(x["icir"])))
+    scored.sort(key=lambda x: (x["l1_ok"], abs(x["icir"])), reverse=True)
     return scored[:top_k]
 
 def main():

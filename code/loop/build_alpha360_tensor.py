@@ -28,6 +28,8 @@ VAL_LO, VAL_HI = date(2025, 1, 1), date(2026, 12, 31)
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample-every", type=int, default=1, help="隔 N 天采样一个样本（降采样）")
+    ap.add_argument("--pit-stats", action="store_true",
+                    help="PIT 严格版：z-score 只用训练期(<=2024-12-31)统计，不用全样本（防特征泄漏）")
     args = ap.parse_args()
     S = args.sample_every
     OUT.mkdir(exist_ok=True)
@@ -43,11 +45,28 @@ def main():
 
     # 2. 特征工程（按股票）
     print("[2/4] 特征工程（z-score + ret_1d + fwd_5d）...")
-    d = df.with_columns([
-        pl.col(c).sub(pl.col(c).mean().over('股票代码')).truediv(
-            pl.col(c).std().over('股票代码').add(1e-9)).alias(f"z_{c}")
-        for c in FCOLS
-    ]).with_columns([
+    if args.pit_stats:
+        # PIT 严格版：z-score 用训练期统计（只到 2024-12-31），防止验证期信息泄漏进特征
+        print("  PIT 严格版：z-score 用训练期(<=2024-12-31)统计")
+        stat_exprs = []
+        for c in FCOLS:
+            stat_exprs.append(pl.col(c).mean().alias(f'{c}_m'))
+            stat_exprs.append(pl.col(c).std().alias(f'{c}_s'))
+        stat = (df.filter(pl.col('日期') <= TRAIN_HI)
+                .group_by('股票代码')
+                .agg(stat_exprs))
+        d = df.join(stat, on='股票代码', how='left')
+        d = d.with_columns([
+            pl.col(c).sub(pl.col(f'{c}_m')).truediv(pl.col(f'{c}_s').add(1e-9)).alias(f"z_{c}")
+            for c in FCOLS
+        ])
+    else:
+        d = df.with_columns([
+            pl.col(c).sub(pl.col(c).mean().over('股票代码')).truediv(
+                pl.col(c).std().over('股票代码').add(1e-9)).alias(f"z_{c}")
+            for c in FCOLS
+        ])
+    d = d.with_columns([
         (pl.col('收盘') / pl.col('收盘').shift(1) - 1).over('股票代码').alias('ret_1d'),
         (pl.col('收盘').shift(-5) / pl.col('收盘') - 1).over('股票代码').alias('fwd_5d'),
     ])
