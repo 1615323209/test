@@ -492,10 +492,15 @@ def l2_half_life(expr, df=None):
     except Exception:
         return None
 
-# ============ L1 主流程（LLM 生成 + 修正） ============
+# ============ L1 主流程（LLM 生成 + G0-G4 漏斗修正） ============
 def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False):
-    """生成一个因子并过 L1 修正。返回 dict 或 None"""
+    """生成一个因子并过 L1（G0-G4 漏斗）修正。返回 dict 或 None
+    2026-08-17 接入 factor_loop_gates.l1_gate_pipeline（替代旧 l1_ic_metrics 单一体检），
+    顺带修复：缺陷 11（提前放弃 20%）、缺陷 12（best_fail_reason 初始化）"""
+    from loop.factor_loop_gates import l1_gate_pipeline
     seed = batch_id * 1000 + factor_idx
+    best_fail_reason = ""  # 缺陷 12 修复：首轮异常时不再 NameError
+    best_t_nw = None       # 缺陷 11：提前放弃基线（首轮通过 G2 的 |t_NW|）
     system = """你是 A 股量化因子研究员，精通 Polars 表达式。你的任务是发明有金融逻辑的因子。
 规则：
 1. 【最重要】只能使用数据字典里列出的列名，一字不差（如 收盘、ret_5d、turn_ma5）。禁止自编列名！常见错误列名黑名单（绝对不可用）：成交量、成交额、收盘价、开盘价、最高价、最低价、收益率、涨跌幅、涨幅、volume、close、open——这些都不在字典里，用了就作废
@@ -512,8 +517,8 @@ def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False):
     best = None
     for rnd in range(1, max_rounds + 1):
         if rnd > 1 and best:
-            user = (f"上一轮因子 {best['name']} 检验结果：ICIR={best['icir']}，"
-                    f"请修改公式以优化 |ICIR|，输出新的 JSON 数组（1 个因子）")
+            user = (f"上一轮因子 {best['name']} 检验结果：{best.get('gate','')} {best.get('why','')}，"
+                    f"请根据失败原因修正公式，输出新的 JSON 数组（1 个因子）")
         elif rnd > 1:
             user = (f"上一轮失败原因：{best_fail_reason}。请修正后重试，输出新的 JSON 数组（1 个因子），"
                     f"严格遵守列名黑名单")
@@ -527,26 +532,37 @@ def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False):
             f = factors[0]
             name, logic, expr_str = f.get("name"), f.get("logic"), f.get("expr")
             narrative = f.get("narrative", logic)
-            # 列名校验
-            ok, reason = validate_expr(expr_str)
+            # G0-G4 漏斗（含列名校验/沙箱/主周期/完整/留出）
+            ok, gate, why, cand = l1_gate_pipeline(
+                {"name": name, "expr": expr_str, "logic": logic, "narrative": narrative},
+                verbose=False)
             if not ok:
-                print(f"    [L1 b{batch_id}f{factor_idx} r{rnd}] {reason}")
-                best_fail_reason = reason
-                continue
-            # 多周期 IC
-            passed, metrics, why = l1_ic_metrics(eval(expr_str, {"pl": pl}))
-            if not passed:
-                print(f"    [L1 b{batch_id}f{factor_idx} r{rnd}] {name}: {why}")
+                print(f"    [L1 b{batch_id}f{factor_idx} r{rnd}] {name}: [{gate}] {why}")
                 if rnd == max_rounds:
                     break
-                best = {"name": name, "icir": metrics.get("icir", 0)}
+                best = {"name": name, "gate": gate, "why": why}
+                best_fail_reason = f"卡在{gate}: {why}"
+                # 缺陷 11：|t_NW| 比首轮低 20% 以上即终止该血统（仅 G2+ 才比较）
+                if gate in ("g2", "g3", "g4") and best_t_nw is not None and cand.get("t_nw_design"):
+                    if abs(cand["t_nw_design"]) < 0.8 * abs(best_t_nw):
+                        print(f"    [L1 b{batch_id}f{factor_idx} r{rnd}] 提前放弃: |t_NW| 比首轮低 20%+")
+                        break
                 continue
+            # 通过 G0-G4：记录首轮 t_NW 基线（后续轮提前放弃用）
+            if best_t_nw is None and cand.get("t_nw_design"):
+                best_t_nw = cand["t_nw_design"]
             return {"name": name, "logic": logic, "narrative": narrative,
                     "expr": expr_str, "expr_hash": expr_hash(expr_str),
-                    "ic_metrics": metrics, "batch_id": batch_id, "factor_idx": factor_idx,
-                    "seed": seed, "rounds": rnd, "version_chain": [{"v": 1, "expr": expr_str}]}
+                    "ic_metrics": cand.get("l1_metrics", {}),
+                    "t_nw_design": cand.get("t_nw_design"),
+                    "t_nw_holdout": cand.get("t_nw_holdout"),
+                    "batch_id": batch_id, "factor_idx": factor_idx,
+                    "seed": seed, "rounds": rnd,
+                    "n_peek": rnd,  # 每轮窥视设计段 1 次（L1 文档第二章，L3 多重检验 N 输入）
+                    "version_chain": [{"v": 1, "expr": expr_str}]}
         except Exception as e:
             print(f"    [L1 b{batch_id}f{factor_idx} r{rnd}] API错误: {e}")
+            best_fail_reason = f"API错误: {e}"
             time.sleep(2)
     return None
 
