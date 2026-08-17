@@ -73,7 +73,8 @@ def build_dict():
         "up_streak": "连涨天数", "down_streak": "连跌天数",
         HORIZON: "未来5日收益（预测目标）",
     }
-    lines = [f"- {c}: {desc.get(c, 'Float32 因子值')}" for c in s.names() if c not in ("日期", "股票代码", HORIZON)]
+    lines = [f"- {c}: {desc.get(c, 'Float32 因子值')}" for c in s.names()
+             if c not in ("日期", "股票代码") and not c.startswith("fwd_")]
     return "\n".join(lines)
 
 # ---------- 3. LLM 调用 ----------
@@ -125,15 +126,19 @@ def parse_factors(text):
 def eval_ic(expr_str):
     """返回 (dict) 或 None；expr_str 是 polars Expr 代码字符串"""
     try:
-        # 受限 eval：只允许 polars Expr 构建
-        if not re.fullmatch(r"[A-Za-z0-9_\.\(\)\[\]\'\", \+\-\*/%<>!=&|]+", expr_str):
+        # 受限 eval：只允许 polars Expr 构建（中文列名需放行）
+        if not re.fullmatch(r"[A-Za-z0-9_\u4e00-\u9fff\.\(\)\[\]'\" ,\+\-\*/%<>=!&|]+", expr_str):
             return None
         expr = eval(expr_str, {"__builtins__": {}}, {"pl": pl})
     except Exception:
         return None
     try:
-        d = pl.scan_parquet(IC_DATA).select(["日期", HORIZON] + [c for c in
-            pl.scan_parquet(IC_DATA).collect_schema().names() if c not in ("日期", HORIZON)]).collect()
+        # 训练集切片（2021-2024），禁止验证集参与（L1 文档第六章第 7 条）
+        cols = pl.scan_parquet(IC_DATA).collect_schema().names()
+        d = (pl.scan_parquet(IC_DATA)
+             .filter((pl.col("日期") >= date(2021, 1, 1)) & (pl.col("日期") <= date(2024, 12, 31)))
+             .select(["日期", HORIZON] + [c for c in cols if c not in ("日期", HORIZON)])
+             .collect())
         d = d.with_columns(expr.alias("_cand"))
         ic = (d.select(["日期", "_cand", HORIZON])
               .group_by("日期")

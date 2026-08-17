@@ -18,6 +18,10 @@ FACTOR_MAIN = DATA_DIR / "factor_daily.parquet"
 FACTOR_INCR = DATA_DIR / "factor_daily_incr.parquet"
 MARKET = DATA_DIR / "market_daily.parquet"
 TRAIN_LO, TRAIN_HI = date(2021, 1, 1), date(2024, 12, 31)
+# L1 内部样本切分（L1 文档第二章）：设计段 2021-2023（生成/反馈/判定唯一口径）
+# 内层留出 2024（仅 G4 一次性确认）。embargo 10 交易日。
+DESIGN_LO, DESIGN_HI = date(2021, 1, 1), date(2023, 12, 31)
+HOLDOUT_LO, HOLDOUT_HI = date(2024, 1, 1), date(2024, 12, 31)
 # ic_data 实际含 fwd_1d/5d/10d/20d（无 3d），用 1d/5d/10d/20d 构成多周期体检
 HORIZONS = ["fwd_1d", "fwd_5d", "fwd_10d", "fwd_20d"]
 MAIN_HORIZON = "fwd_5d"
@@ -25,6 +29,7 @@ MAIN_HORIZON = "fwd_5d"
 # 与 llm_factor_synth 复用的 DeepSeek 客户端
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from loop.llm_factor_synth import load_deepseek_key, llm_chat
+from loop.expr_sandbox import safe_compile, is_fwd_col
 
 # ============ 数据层（训练集只读一次，缓存在内存） ============
 _cache = {}
@@ -36,6 +41,24 @@ def load_train_df():
     s = pl.scan_parquet(IC_DATA)
     df = s.filter((pl.col("日期") >= TRAIN_LO) & (pl.col("日期") <= TRAIN_HI)).collect()
     _cache["train"] = df
+    return df
+
+def load_design_df():
+    """加载设计段(2021-2023)因子+forward收益（L1 判定唯一口径）"""
+    if "design" in _cache:
+        return _cache["design"]
+    s = pl.scan_parquet(IC_DATA)
+    df = s.filter((pl.col("日期") >= DESIGN_LO) & (pl.col("日期") <= DESIGN_HI)).collect()
+    _cache["design"] = df
+    return df
+
+def load_holdout_df():
+    """加载内层留出段(2024)（仅 G4 一次性确认用）"""
+    if "holdout" in _cache:
+        return _cache["holdout"]
+    s = pl.scan_parquet(IC_DATA)
+    df = s.filter((pl.col("日期") >= HOLDOUT_LO) & (pl.col("日期") <= HOLDOUT_HI)).collect()
+    _cache["holdout"] = df
     return df
 
 def load_full_ic_cols():
@@ -81,43 +104,136 @@ def calc_multi_ic(expr, df=None, horizons=None):
         }
     return out
 
-def l1_ic_metrics(expr):
-    """完整 L1 多周期体检，返回 (通过与否, 指标dict, 拒绝原因)"""
-    res = calc_multi_ic(expr)
+# ============ L1: 辅助检验函数（L1 文档第五章 G2/G3 口径） ============
+def newey_west_t(ic_series, lag=10):
+    """Newey-West 校正 t 值（修正重叠标签自相关导致的 t 虚高，L1 文档 G2）
+    t_NW = mean / SE(mean)，SE(mean) = sqrt(Var_NW / n)
+    Var_NW = γ0 + 2·Σ(1-k/(lag+1))·γk（γk 为滞后 k 自协方差）"""
+    v = np.asarray(ic_series, dtype=float)
+    v = v[np.isfinite(v)]
+    n = len(v)
+    if n < 30:
+        return 0.0
+    mu = v.mean()
+    d = v - mu
+    gamma = np.correlate(d, d, mode='full')[n - 1:]  # Σd_i·d_{i+k}（未归一化）
+    gamma = gamma / n  # 归一化为自协方差
+    k = np.arange(1, lag + 1)
+    var_nw = gamma[0] + 2 * np.sum((1 - k / (lag + 1)) * gamma[1:lag + 1])
+    if var_nw <= 0:
+        return 0.0
+    se = np.sqrt(var_nw / n)  # 标准误
+    return float(mu / se) if se > 0 else 0.0
+
+def year_sign_check(ic_series, dates, main_sign):
+    """分年符号一致（替代旧"滚动60日ICIR min>0"）：每年 IC 同号；
+    任一年反向且 |t_year|≥2 → 拒（L1 文档 G3）"""
+    if len(ic_series) != len(dates) or len(ic_series) < 100:
+        return True, ""
+    df = pd.DataFrame({"d": dates, "ic": ic_series})
+    df["y"] = pd.to_datetime(df["d"]).dt.year
+    for y, g in df.groupby("y"):
+        m, s = g["ic"].mean(), g["ic"].std()
+        if m * main_sign < 0 and s > 0 and abs(m / s) >= 2:
+            return False, f"{y}年反向(t={m/s:.2f})"
+    return True, ""
+
+def seg_ok_check(ic_series, dates, main_sign):
+    """半年段一致：seg_ok_ratio ≥ 60% 且 last2_ok（L1 文档 G3）"""
+    if len(ic_series) != len(dates) or len(ic_series) < 100:
+        return 1.0, True
+    df = pd.DataFrame({"d": dates, "ic": ic_series})
+    dts = pd.to_datetime(df["d"])
+    df["seg"] = (dts.dt.year - 2010) * 2 + (dts.dt.month > 6)
+    seg_ics = df.groupby("seg")["ic"].mean()
+    ratio = float((seg_ics * main_sign > 0).mean())
+    last2 = bool((seg_ics.tail(2) * main_sign > 0).all())
+    return ratio, last2
+
+def quintile_mono(expr, df, main_sign):
+    """横截面 quintile 单调性（从 L2 上移 L1 G3，L2 文档缺陷 11）"""
+    try:
+        d = df.with_columns(expr.alias("_f"))
+        d2 = d.filter(pl.col("_f").is_not_null() & pl.col("_f").is_finite()
+                      & pl.col(MAIN_HORIZON).is_not_null() & pl.col(MAIN_HORIZON).is_finite())
+        if len(d2) < 10000:
+            return 0.0
+        d2 = d2.with_columns([
+            pl.col("_f").rank().over("日期").alias("_rk"),
+            pl.col("_f").count().over("日期").alias("_n"),
+        ])
+        d2 = d2.with_columns((pl.col("_rk") / pl.col("_n") * 5).cast(pl.Int32).clip(0, 4).alias("_q"))
+        q = d2.group_by("_q").agg(pl.col(MAIN_HORIZON).mean().alias("m")).sort("_q")
+        qv = q["m"].to_list()
+        if len(qv) >= 3 and np.std(qv) > 0:
+            return float(abs(np.corrcoef(np.arange(len(qv)), qv)[0, 1]))
+        return 0.0
+    except Exception:
+        return 0.0
+
+def l1_ic_metrics(expr, df=None):
+    """完整 L1 体检（L1 文档第五章：G2 主周期 + G3 完整体检）
+    口径：设计段 2021-2023（L1 判定唯一口径，防 L1 反复窥视验证集）
+    检查：|t_NW|≥3.0 / 次周期同号 / 衰减<50% / 分年符号一致 /
+          半年段一致 / quintile 单调≥0.3 / Rank vs Normal
+    返回 (通过与否, 指标dict, 拒绝原因)
+    """
+    df = df if df is not None else load_design_df()
+    res = calc_multi_ic(expr, df=df)
     if res is None or res[MAIN_HORIZON] is None:
         return False, {}, "表达式执行失败"
     main = res[MAIN_HORIZON]
-    # 1. 主周期显著
-    if abs(main["icir"]) < 0.25:
-        return False, main, f"主周期|ICIR|<0.25: {main['icir']}"
-    # 2. 次周期同号
+    ic_series = main.get("_ic_series", [])
+    # 日期序列（分年/分段检查用，与 IC 序列同序）
+    try:
+        dates = (df.with_columns(expr.alias("_cand2"))
+                 .select(["日期", "_cand2", MAIN_HORIZON])
+                 .group_by("日期")
+                 .agg(pl.corr(pl.col("_cand2"), pl.col(MAIN_HORIZON), method="spearman").alias("ic"))
+                 .filter(pl.col("ic").is_not_null() & pl.col("ic").is_finite())
+                 .sort("日期")["日期"].to_list())
+    except Exception:
+        dates = []
+    # G2: 主周期显著性（Newey-West t，lag=10 修正重叠标签）
+    t_nw = newey_west_t(ic_series)
+    if abs(t_nw) < 3.0:
+        return False, main, f"主周期|t_NW|<3.0: {t_nw:.2f}"
     main_sign = 1 if main["ic_mean"] > 0 else -1
+    # 次周期同号
     for hz in ["fwd_1d", "fwd_10d", "fwd_20d"]:
         r = res.get(hz)
         if r and r["ic_mean"] * main_sign < 0:
             return False, main, f"次周期{hz}异号"
-    # 3. 衰减曲线: fwd_5d → fwd_10d |IC| 衰减 <50%
+    # 衰减曲线: fwd_5d → fwd_10d |IC| 衰减 <50%
     r10 = res.get("fwd_10d")
     if r10 and r10["ic_mean"]:
         decay = abs(main["ic_mean"]) - abs(r10["ic_mean"])
         if decay / max(abs(main["ic_mean"]), 1e-9) > 0.5:
-            return False, main, f"IC衰减过快: 5d->10d 衰减 {decay/abs(main['ic_mean'])*100:.0f}%"
-    # 4. 滚动 60 日 ICIR min > 0
-    series = main["_ic_series"]
-    if len(series) >= 60:
-        arr = np.array(series)
-        roll_min = min(arr[i:i+60].mean() / max(arr[i:i+60].std(), 1e-9)
-                       for i in range(0, len(arr) - 59, 30))
-        if roll_min <= 0:
-            return False, main, f"滚动60日ICIR min={roll_min:.3f} <= 0"
-    # 5. Rank(Normal) IC 同号 / 重尾容忍
-    normal_ic = calc_normal_ic(expr, df=load_train_df())
+            return False, main, f"IC衰减过快: {decay/abs(main['ic_mean'])*100:.0f}%"
+    # 分年符号一致（替代旧"滚动60日ICIR min>0"，L1 文档 G3）
+    ok, why = year_sign_check(ic_series, dates, main_sign)
+    if not ok:
+        return False, main, why
+    # 半年段一致
+    seg_ok, last2 = seg_ok_check(ic_series, dates, main_sign)
+    if seg_ok < 0.6 or not last2:
+        return False, main, f"分段稳定不足: seg_ok={seg_ok:.2f} last2={last2}"
+    main["seg_ok_ratio"] = round(seg_ok, 3)
+    main["last2_ok"] = last2
+    # quintile 单调（从 L2 上移；黑箱来源 ≥0.5 由生成端标注）
+    mono = quintile_mono(expr, df, main_sign)
+    if abs(mono) < 0.3:
+        return False, main, f"quintile单调弱: {mono:.3f}"
+    main["mono"] = round(mono, 3)
+    # Rank(Normal) IC 同号 / 重尾容忍
+    normal_ic = calc_normal_ic(expr, df=df)
     if normal_ic is not None:
         n_sign = 1 if normal_ic > 0 else -1
         if n_sign != main_sign:
             if abs(normal_ic) < 2 * abs(main["ic_mean"]):
                 return False, main, f"Rank/Normal异号且无极端值优势 (normal={normal_ic:.4f})"
-            main["extreme_driven"] = True   # 标记重尾驱动，L2 复核 quintile
+            main["extreme_driven"] = True  # 标记重尾驱动，L2 复核
+    main["t_nw"] = round(t_nw, 2)
     return True, main, ""
 
 def calc_normal_ic(expr, df=None):
@@ -137,12 +253,17 @@ def calc_normal_ic(expr, df=None):
 NON_PRICE_COLS = set()  # 未来放财务/行业列名；当前 45 因子全是量价衍生，自动 PIT 安全
 
 def validate_expr(expr_str):
-    """列名校验 + PIT 检查。返回 (通过与否, 原因)"""
+    """列名校验 + PIT 检查（L1 文档第六章：AST 沙箱 + fwd_* 黑名单 + 未注册列默认拒）。
+    返回 (通过与否, 原因)"""
+    # AST 沙箱：算子白名单 + fwd_* 硬黑名单 + 时序算子强制 over + 幻觉列
+    _, err = safe_compile(expr_str)
+    if err:
+        return False, err
     valid_cols = set(load_full_ic_cols())
     used = re.findall(r"pl\.col\(['\"]([^'\"]+)['\"]\)", expr_str)
     for c in used:
         if c not in valid_cols:
-            return False, f"幻觉列名: {c}"
+            return False, f"未注册列: {c}"
         if c in NON_PRICE_COLS:
             return False, f"非量价列未过PIT: {c}"
     return True, ""
@@ -204,7 +325,9 @@ def l2_dedup(expr, pool_exprs, df=None):
         cand = sample.with_columns(expr.alias("_c"))
         for p in pool_exprs:
             try:
-                pe = eval(p["expr"], {"pl": pl})
+                pe, perr = safe_compile(p["expr"])
+                if pe is None:
+                    continue
                 merged = cand.with_columns(pe.alias("_p"))
                 pear = merged.select(pl.corr(pl.col("_c"), pl.col("_p"))).item()
                 spe = merged.select(pl.corr(pl.col("_c"), pl.col("_p"), method="spearman")).item()
@@ -224,10 +347,15 @@ def l2_orthogonal(expr, base_exprs, df=None):
     sample = df.sample(n=300_000, seed=7)
     try:
         y = sample.with_columns(expr.alias("_y"))["_y"].to_numpy()
-        X = np.column_stack([
-            sample.with_columns(eval(b, {"pl": pl}).alias("_x"))["_x"].to_numpy()
-            for b in base_exprs
-        ])
+        X_cols = []
+        for b in base_exprs:
+            be, berr = safe_compile(b)
+            if be is None:
+                continue
+            X_cols.append(sample.with_columns(be.alias("_x"))["_x"].to_numpy())
+        if not X_cols:
+            return True, 0.0, 0.0
+        X = np.column_stack(X_cols)
         mask = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
         y, X = y[mask], X[mask]
         if len(y) < 10000 or X.shape[1] == 0:
@@ -251,47 +379,62 @@ def l2_orthogonal(expr, base_exprs, df=None):
     except Exception as e:
         return True, 0.0, 0.0   # 数值失败不拦（保守放行，L3 把关）
 
-# ============ L2: regime 分层 ============
+# ============ L2: regime 分层（L2 文档第四章第 4 节） ============
 def l2_regime(expr, df=None):
-    """牛/熊/震荡三态 IC 方向一致才通过"""
-    df = df if df is not None else load_train_df()
+    """牛/熊/震荡三态 IC 方向一致且 |ICIR|≥0.15 才通过。
+
+    修复（L2 文档缺陷 1/5）：
+    - _cand 列现在真正物化（旧版从未物化 → 恒抛异常 → except 放行）
+    - 三态划分：hs300 MA20（方向）+ 涨停家数（情绪）
+      - 牛: close >= ma_20
+      - 熊: close < ma_20 且 涨停家数 < 中位数
+      - 震荡: close < ma_20 且 涨停家数 >= 中位数
+    - 判定口径改设计段 2021-2023（L2 文档第三章）
+    返回 (通过, {regime: icir})
+    """
+    df = df if df is not None else load_design_df()
     try:
         market = pl.read_parquet(MARKET).select(["日期", "涨停家数"]).sort("日期")
-        # regime: 用沪深300 MA20 判断（简化：hs300 close vs ma20）
+        # 注意：ic_data 自带股票级 ma_20 列，join hs300 必须用 suffix 区分（旧版缺陷：列名冲突
+        # 导致用股票 ma_20 与指数 close 比较，regime 划分错位）
         hs300 = pl.read_parquet(DATA_DIR / "hs300.parquet").select(["日期", "close", "ma_20"])
-        d = df.join(hs300, on="日期", how="left").join(market, on="日期", how="left")
-        d = d.with_columns(
-            ((pl.col("close") > pl.col("ma_20")).alias("bull")).fill_null(False)
-        )
-        ic_series = (d.select(["日期", "_cand" if "_cand" in d.columns else "日期"])
-                     .group_by("日期").agg(pl.len()))
-        # 直接逐日 IC
-        dd = d.with_columns(pl.lit(1).alias("_tmp"))
-        ic = (d.select(["日期", "_cand", MAIN_HORIZON, "bull"])
+        d = df.join(hs300, on="日期", how="left", suffix="_hs").join(market, on="日期", how="left")
+        # 物化候选列（旧版缺陷：从未物化 _cand）
+        d = d.with_columns(expr.alias("_cand"))
+        # 涨停家数中位数（设计段内）
+        zt_med = d["涨停家数"].median()
+        d = d.with_columns([
+            pl.when(pl.col("close") >= pl.col("ma_20_hs")).then(pl.lit("牛"))
+              .when((pl.col("close") < pl.col("ma_20_hs")) & (pl.col("涨停家数") < zt_med)).then(pl.lit("熊"))
+              .otherwise(pl.lit("震荡")).alias("regime"),
+        ])
+        ic = (d.select(["日期", "_cand", MAIN_HORIZON, "regime"])
               .group_by("日期")
               .agg([pl.corr(pl.col("_cand"), pl.col(MAIN_HORIZON), method="spearman").alias("ic"),
-                    pl.col("bull").first().alias("bull")])
+                    pl.col("regime").first().alias("regime")])
               .filter(pl.col("ic").is_not_null() & pl.col("ic").is_finite()))
-        signs = []
-        for regime, name in [(True, "牛"), (False, "熊")]:
-            sub = ic.filter(pl.col("bull") == regime)
-            if len(sub) > 100:
-                m = sub["ic"].mean()
-                s = sub["ic"].std()
+        signs = {}
+        for rname in ["牛", "熊", "震荡"]:
+            sub = ic.filter(pl.col("regime") == rname)
+            if len(sub) > 100:  # 每态样本量下限
+                m, s = sub["ic"].mean(), sub["ic"].std()
                 if s and s > 0:
-                    signs.append((name, m, m / s))
-        if len(signs) >= 2:
-            base_sign = 1 if signs[0][1] > 0 else -1
-            for name, m, ir in signs:
-                if m * base_sign < 0 or abs(ir) < 0.15:
-                    return False, {name: round(ir, 3) for name, m, ir in signs}
-        return True, {name: round(ir, 3) for name, m, ir in signs}
-    except Exception:
-        return True, {}
+                    signs[rname] = round(float(m / s), 3)
+        if len(signs) < 2:
+            return False, signs  # 态数不足无法判定
+        base_sign = 1 if next(iter(signs.values())) > 0 else -1
+        for name, ir in signs.items():
+            if ir * base_sign < 0 or abs(ir) < 0.15:
+                return False, signs
+        return True, signs
+    except Exception as e:
+        # 任何异常必须落盘可见（工程保障：假门禁比没有门禁更危险）
+        return False, {"error": str(e)[:80]}
 
 # ============ L2: 半衰期 ============
 def l2_half_life(expr, df=None):
-    """滚动252日ICIR拟合衰减，返回半衰期(月)"""
+    """滚动252日ICIR拟合衰减，返回半衰期(月)。
+    数据不足/异常返回 None（L2 文档缺陷 10：不乐观兜底 12 月，由调用方标记 half_life_unknown）"""
     df = df if df is not None else load_train_df()
     try:
         d = df.with_columns(expr.alias("_cand"))
@@ -302,36 +445,23 @@ def l2_half_life(expr, df=None):
         ic = ic.filter(pl.col("ic").is_not_null() & pl.col("ic").is_finite())
         v = ic["ic"].to_numpy()
         if len(v) < 300:
-            return 12.0  # 数据不足默认长寿命
+            return None  # 数据不足 → unknown，不乐观兜底
         # 滚动252日 ICIR
         ics = []
         for i in range(0, len(v) - 251, 63):
             w = v[i:i+252]
             ics.append(w.mean() / max(w.std(), 1e-9))
         if len(ics) < 4:
-            return 12.0
+            return None
         ics = np.array(ics)
         # 线性拟合斜率（每段=3个月）
         slope = np.polyfit(np.arange(len(ics)), ics, 1)[0]
         if slope >= 0:
-            return 12.0  # 无衰减
+            return 12.0  # 无衰减，默认长寿命
         half = abs(ics[0] / (2 * slope)) * 3  # 月
         return round(min(max(half, 1), 24), 1)
     except Exception:
-        return 12.0
-
-# ============ L2: 反因子 ============
-def l2_reverse_check(expr, df=None):
-    """构造 -expr，验证反向 ICIR 显著为负且 |ICIR| 接近"""
-    df = df if df is not None else load_train_df()
-    neg = -expr
-    res = calc_multi_ic(neg, df=df, horizons=[MAIN_HORIZON])
-    if res is None or res[MAIN_HORIZON] is None:
-        return False, "反因子计算失败"
-    r = res[MAIN_HORIZON]
-    if abs(r["icir"]) < 0.25:
-        return False, f"反因子|ICIR|<0.25: {r['icir']}"
-    return True, {"reverse_icir": r["icir"]}
+        return None
 
 # ============ L1 主流程（LLM 生成 + 修正） ============
 def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False):
@@ -422,7 +552,9 @@ def parse_json(text):
 def l2_pipeline(cand, pool_exprs, api_key, df=None, verbose=True):
     """候选因子过 L2 全管线。返回 (通过与否, 原因, 增强的cand)"""
     df = df if df is not None else load_train_df()
-    expr = eval(cand["expr"], {"pl": pl})
+    expr, serr = safe_compile(cand["expr"])
+    if expr is None:
+        return False, f"表达式沙箱拒绝: {serr}", cand
     # 1. 精算层
     fine = l2_fine_eval(expr, df=df)
     if fine is None:
@@ -453,16 +585,13 @@ def l2_pipeline(cand, pool_exprs, api_key, df=None, verbose=True):
     # 5. 半衰期
     hl = l2_half_life(expr, df=df)
     cand["half_life"] = hl
-    if hl < 6:
+    if hl is not None and hl < 6:
         cand["short_lived"] = True
-    # 6. 反因子
-    ok, rev = l2_reverse_check(expr, df=df)
-    if not ok:
-        return False, f"反因子: {rev}", cand
-    cand["reverse_metrics"] = rev
+    if hl is None:
+        cand["half_life_unknown"] = True  # L2 文档缺陷 10：算不出 → 标记 unknown，不乐观兜底
     if verbose:
         print(f"    [L2] {cand['name']} 通过: 换手={fine['turn_exp']} mono={fine['mono']} "
-              f"残差ICIR={resid_icir} regime={reg} 半衰期={hl}月 反ICIR={rev['reverse_icir']}")
+              f"残差ICIR={resid_icir} regime={reg} 半衰期={hl}月")
     return True, "", cand
 
 if __name__ == "__main__":
