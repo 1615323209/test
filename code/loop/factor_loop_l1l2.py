@@ -269,10 +269,26 @@ def validate_expr(expr_str):
     return True, ""
 
 # ============ L1: seed 确定性 ============
-def make_prompt(batch_id, factor_idx, seed, ddict):
-    """带 seed 的生成 prompt（seed 注入影响采样）"""
-    return (f"请生成 1 个预测 {MAIN_HORIZON} 的因子。\n"
-            f"（确定性采样 seed={seed}，请基于金融逻辑，不要受 seed 影响）\n\n"
+# L1 文档 8.3-C1：已发表 anomaly 先验（LLM 从"发明"转向"复现+适配"）
+ANOMALY_PRIORS = [
+    "Amihud 非流动性: illiq_20 高 → 未来收益高（低流动性溢价，A股小盘/次新显著）",
+    "彩票偏好/MAX 效应: skew_20 或日收益偏度 → 高偏度(彩票)未来收益低",
+    "52 周高点: 接近 high_60d/high_20d 的相对位置 → 动量延续或反转（方向须声明）",
+    "成交量冲击: vol_ratio / vol_change_5d 激增 → 短期反转（量能过热）",
+    "隔夜-日内拉锯: gap=开盘/昨收-1 与 intraday=收盘/开盘-1 的 20 日均值横截面排序差（T+1 制度特有，隔夜风险无法对冲）",
+    "异质波动率/低波异象: 收盘滚动 std/mean → 高波动未来收益低",
+    "换手率族: turn_ratio / turn_ma5 高 → 未来收益低（过度交易）",
+]
+
+def make_prompt(batch_id, factor_idx, seed, ddict, pool_topics=None):
+    """生成 prompt：C1 复现 anomaly + 反冗余主题配额（L1 文档 8.3-C1 / 第七章）"""
+    topics = ""
+    if pool_topics:
+        topics = f"\n已入池/候选因子主题（避免重复挖掘同一主题，请从欠代表主题出题）:\n{pool_topics}\n"
+    return (f"请生成 1 个预测 {MAIN_HORIZON} 的因子。优先复现以下已发表 anomaly 并针对 A 股制度（T+1/涨跌停/散户占比高/板块炒作）做适配改造：\n"
+            + "\n".join(f"- {a}" for a in ANOMALY_PRIORS)
+            + topics
+            + f"（确定性采样 seed={seed}，请基于金融逻辑，不要受 seed 影响）\n\n"
             f"数据字典（可用列）:\n{ddict}")
 
 # ============ L2: 精算层（换手暴露 + quintile） ============
@@ -509,27 +525,27 @@ def l2_half_life(expr, df=None):
         return None
 
 # ============ L1 主流程（LLM 生成 + G0-G4 漏斗修正） ============
-def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False):
+def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False, pool_topics=None):
     """生成一个因子并过 L1（G0-G4 漏斗）修正。返回 dict 或 None
     2026-08-17 接入 factor_loop_gates.l1_gate_pipeline（替代旧 l1_ic_metrics 单一体检），
-    顺带修复：缺陷 11（提前放弃 20%）、缺陷 12（best_fail_reason 初始化）"""
+    顺带修复：缺陷 11（提前放弃 20%）、缺陷 12（best_fail_reason 初始化）
+    2026-08-17 C1 升级：复现 anomaly + 契约字段（declared_direction/hypothesis）"""
     from loop.factor_loop_gates import l1_gate_pipeline
     seed = batch_id * 1000 + factor_idx
     best_fail_reason = ""  # 缺陷 12 修复：首轮异常时不再 NameError
     best_t_nw = None       # 缺陷 11：提前放弃基线（首轮通过 G2 的 |t_NW|）
-    system = """你是 A 股量化因子研究员，精通 Polars 表达式。你的任务是发明有金融逻辑的因子。
+    system = """你是 A 股量化因子研究员，精通 Polars 表达式。你的任务是【复现学术界已发表的 anomaly 因子，并针对 A 股制度特征做适配改造】——不要自由发明全新公式（自由发明的先验近乎为零，v1/v2 已证明）。
 规则：
-1. 【最重要】只能使用数据字典里列出的列名，一字不差（如 收盘、ret_5d、turn_ma5）。禁止自编列名！常见错误列名黑名单（绝对不可用）：成交量、成交额、收盘价、开盘价、最高价、最低价、收益率、涨跌幅、涨幅、volume、close、open——这些都不在字典里，用了就作废
+1. 【最重要】只能使用数据字典里列出的列名，一字不差。禁止自编列名！黑名单（绝对不可用）：成交量、成交额、收盘价、开盘价、最高价、最低价、收益率、涨跌幅、涨幅、volume、close、open
 2. 预测目标 fwd_5d（未来5日收益）
-3. 表达式必须是合法的 polars Expr 代码
-4. 支持：+ - * /、pl.col、.rolling_mean/.rolling_std/.rolling_max/.rolling_min（min_samples 必须给）、.rank().over('日期')、.shift(1).over('股票代码')
+3. 表达式必须是合法的 polars Expr 代码；时序算子（rolling_*/shift/diff）必须带 .over('股票代码')
+4. 优先复现：Amihud 非流动性(illiq_20)、彩票偏好(skew_20)、52周高点、成交量冲击、隔夜-日内拉锯(开盘/最高/最低)、低波异象、换手率族——做 A 股适配（T+1 隔夜风险、涨跌停不可买、散户反转强、板块相对强弱）
 5. 不要用未定义的列，不要 import
-6. 每个因子必须有金融逻辑
-7. 输出严格 JSON 数组（不要多余文字），每项：{"name": "英文名", "logic": "金融逻辑", "expr": "polars表达式"}
-8. 额外：给每个因子一句话经济叙事，字段名 narrative
+6. 每个因子必须声明预期方向 declared_direction（+1=因子值高→未来收益高，-1=因子值高→未来收益低）和 hypothesis（一句话可验证的经济逻辑，非事后叙事）
+7. 输出严格 JSON 数组（不要多余文字），每项：{"name": "英文名", "logic": "金融逻辑", "expr": "polars表达式", "narrative": "一句话叙事", "declared_direction": 1或-1, "hypothesis": "可验证假设"}
 
 数据字典："""
-    user = make_prompt(batch_id, factor_idx, seed, ddict)
+    user = make_prompt(batch_id, factor_idx, seed, ddict, pool_topics=pool_topics)
     best = None
     for rnd in range(1, max_rounds + 1):
         if rnd > 1 and best:
@@ -548,9 +564,14 @@ def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False):
             f = factors[0]
             name, logic, expr_str = f.get("name"), f.get("logic"), f.get("expr")
             narrative = f.get("narrative", logic)
-            # G0-G4 漏斗（含列名校验/沙箱/主周期/完整/留出）
+            declared_direction = f.get("declared_direction")
+            if declared_direction not in (1, -1, 1.0, -1.0):
+                declared_direction = None  # 未声明 → G2 跳过符号检查
+            hypothesis = f.get("hypothesis", logic)
+            # G0-G4 漏斗（含列名校验/沙箱/主周期/完整/留出 + 声明符号检查）
             ok, gate, why, cand = l1_gate_pipeline(
-                {"name": name, "expr": expr_str, "logic": logic, "narrative": narrative},
+                {"name": name, "expr": expr_str, "logic": logic, "narrative": narrative,
+                 "declared_direction": declared_direction, "hypothesis": hypothesis},
                 verbose=False)
             if not ok:
                 print(f"    [L1 b{batch_id}f{factor_idx} r{rnd}] {name}: [{gate}] {why}")
@@ -573,6 +594,7 @@ def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False):
                     "t_nw_design": cand.get("t_nw_design"),
                     "t_nw_holdout": cand.get("t_nw_holdout"),
                     "icir_tradable": cand.get("icir_tradable"),
+                    "declared_direction": declared_direction, "hypothesis": hypothesis,
                     "label_spec": {"kind": "fwd_ret", "horizon": 5},  # L1 文档第三章契约：默认预测目标
                     "role": "score",  # 默认选股打分因子（exit/timing 由生成端声明）
                     "batch_id": batch_id, "factor_idx": factor_idx,

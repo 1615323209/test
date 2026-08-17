@@ -35,12 +35,16 @@ def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None):
     batch_id = ck.get("batch_id", 0) + 1
     pool = ck.get("pool", [])
     pool_exprs = [{"expr": p["expr"], "expr_hash": p.get("expr_hash"), "name": p["name"]} for p in pool]
+    # 主题配额（L1 文档第七章反冗余）：注入池内因子主题，要求从欠代表主题出题
+    pool_topics = "\n".join(
+        f"- {p['name']}: {str(p.get('hypothesis') or p.get('logic') or '')[:60]}"
+        for p in pool[-10:]) or "（池为空，自由选择主题）"
     ddict = build_dict()
     added = 0
     for idx in range(n_cands):
         if verbose:
             print(f"  [L1] batch{batch_id} 候选{idx}...")
-        cand = l1_refine(batch_id, idx, api_key, ddict, max_rounds=3, smoke=smoke)
+        cand = l1_refine(batch_id, idx, api_key, ddict, max_rounds=3, smoke=smoke, pool_topics=pool_topics)
         if cand is None:
             append_csv(STATE_DIR / "l1_log.csv", {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                        "batch": batch_id, "idx": idx, "status": "L1失败"})
