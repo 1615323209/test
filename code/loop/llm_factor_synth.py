@@ -88,18 +88,38 @@ def build_dict():
     return "\n".join(lines)
 
 # ---------- 3. LLM 调用 ----------
-def llm_chat(system, user, api_key, temperature=0.7):
+def llm_chat(system, user, api_key, temperature=0.7, seed=None):
     body = {
         "model": MODEL,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "temperature": temperature,
         "max_tokens": 8000,
     }
+    if seed is not None:
+        body["seed"] = seed  # L1 文档第六章第 5 条：请求体带 seed（不再只写进 prompt 文本）
     if REASONING:
         body["reasoning_effort"] = "high"
     r = requests.post(API_URL, headers={"Authorization": f"Bearer {api_key}"}, json=body, timeout=120)
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    resp_text = r.json()["choices"][0]["message"]["content"]
+    # 内容寻址缓存（L1 文档第六章第 5 条：复现 = 重放缓存，provenance 供审计追溯）
+    try:
+        cache_path = Path(r"D:\quant_data\loop_state\llm_cache.json")
+        ph = hashlib.md5(f"{system}|{user}".encode()).hexdigest()[:16]
+        cache = {}
+        if cache_path.exists():
+            try:
+                cache = json.loads(cache_path.read_text(encoding="utf-8"))
+            except Exception:
+                cache = {}
+        cache[ph] = {"prompt_hash": ph, "model": MODEL, "temperature": temperature,
+                     "seed": seed, "response": resp_text[:500],
+                     "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+        cache_path.parent.mkdir(exist_ok=True)
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+    return resp_text
 
 # ---------- 4. 解析 LLM 输出（JSON 数组，容忍 markdown 代码块） ----------
 def parse_factors(text):

@@ -117,6 +117,22 @@ def g4_holdout(expr, main_sign, t_nw_design, df_holdout=None):
         return False, f"G4 显著性衰减: |t_NW_2024|={abs(t):.2f} < max(0.2×{abs(t_nw_design):.2f}, 1.5)", main
     return True, "", main
 
+# ============ 可交易域 ICIR（L3 文档缺陷 3：权重输入，排除不可买样本假 alpha） ============
+def tradable_icir(expr, df=None):
+    """可交易域（非停牌/非涨停/非跌停）主周期 ICIR。
+    返回 float 或 None。上市>120日需上市日期数据（ic_data 无），暂用停牌/涨跌停过滤"""
+    df = df if df is not None else load_design_df()
+    try:
+        d = df.filter((pl.col("is_suspended") == 0)
+                      & (pl.col("limit_up") == 0)
+                      & (pl.col("limit_down") == 0))
+        res = calc_multi_ic(expr, df=d, horizons=[MAIN_HORIZON])
+        if res and res[MAIN_HORIZON]:
+            return round(res[MAIN_HORIZON]["icir"], 3)
+        return None
+    except Exception:
+        return None
+
 # ============ 漏斗入口 ============
 def l1_gate_pipeline(cand, verbose=True):
     """候选过 G0-G4 漏斗。cand: {expr, declared_direction?, name?}
@@ -161,8 +177,10 @@ def l1_gate_pipeline(cand, verbose=True):
     cand["l1_metrics"] = {k: v for k, v in main.items() if k != "_ic_series"}
     cand["t_nw_design"] = main.get("t_nw")
     cand["t_nw_holdout"] = holdout.get("t_nw", 0) if holdout else 0
+    # 可交易域 ICIR（L3 权重输入，L3 文档缺陷 3）
+    cand["icir_tradable"] = tradable_icir(expr)
     if verbose:
-        print(f"    [L1漏斗] {cand.get('name','?')} 通过 G0-G4")
+        print(f"    [L1漏斗] {cand.get('name','?')} 通过 G0-G4 (tradable_icir={cand['icir_tradable']})")
     return True, "", "", cand
 
 def _reject(expr_str, reason):

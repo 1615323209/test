@@ -322,7 +322,8 @@ def l2_dedup(expr, pool_exprs, df=None):
     for p in pool_exprs:
         if p.get("expr_hash") == h:
             return False, "语义重复"
-    # 数值去重：逐日横截面 Pearson/Spearman 相关，取时间均值
+    # 数值去重：逐日横截面 Pearson/Spearman 相关，取时间均值（L2 文档缺陷 7 修复）
+    # + 归一化互信息 MI（L2 文档缺陷 6：一般非线性冗余通道）
     try:
         cand = df.with_columns(expr.alias("_c"))
         for p in pool_exprs:
@@ -342,6 +343,21 @@ def l2_dedup(expr, pool_exprs, df=None):
                 m_spe = float(daily["spe"].mean())
                 if abs(m_pear) >= 0.7 or abs(m_spe) >= 0.7:
                     return False, f"与{p['name']}相关 pear={m_pear:.2f} spe={m_spe:.2f}"
+                # MI 通道：抽样 5 万行分箱离散化算归一化互信息（<0.3 通过）
+                try:
+                    from sklearn.metrics import normalized_mutual_info_score
+                    import pandas as _pd
+                    smp = merged.select(["_c", "_p"]).drop_nulls().sample(n=50_000, seed=7)
+                    c_ser = _pd.Series(smp["_c"].to_numpy())
+                    p_ser = _pd.Series(smp["_p"].to_numpy())
+                    c_bin = _pd.qcut(c_ser, 20, labels=False, duplicates="drop")
+                    p_bin = _pd.qcut(p_ser, 20, labels=False, duplicates="drop")
+                    if len(c_bin) > 1000 and len(p_bin) > 1000:
+                        mi = float(normalized_mutual_info_score(c_bin, p_bin))
+                        if mi >= 0.3:
+                            return False, f"与{p['name']} MI={mi:.2f}>=0.3"
+                except Exception:
+                    pass  # MI 计算失败不拦（辅助通道）
             except Exception:
                 continue
     except Exception:
@@ -523,7 +539,7 @@ def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False):
             user = (f"上一轮失败原因：{best_fail_reason}。请修正后重试，输出新的 JSON 数组（1 个因子），"
                     f"严格遵守列名黑名单")
         try:
-            out = llm_chat(system, user, api_key, temperature=0.3 if rnd == 1 else 0.5)
+            out = llm_chat(system, user, api_key, temperature=0.3 if rnd == 1 else 0.5, seed=seed)
             factors = parse_json(out)
             if not factors:
                 print(f"    [L1 b{batch_id}f{factor_idx} r{rnd}] 解析失败")
@@ -556,6 +572,9 @@ def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False):
                     "ic_metrics": cand.get("l1_metrics", {}),
                     "t_nw_design": cand.get("t_nw_design"),
                     "t_nw_holdout": cand.get("t_nw_holdout"),
+                    "icir_tradable": cand.get("icir_tradable"),
+                    "label_spec": {"kind": "fwd_ret", "horizon": 5},  # L1 文档第三章契约：默认预测目标
+                    "role": "score",  # 默认选股打分因子（exit/timing 由生成端声明）
                     "batch_id": batch_id, "factor_idx": factor_idx,
                     "seed": seed, "rounds": rnd,
                     "n_peek": rnd,  # 每轮窥视设计段 1 次（L1 文档第二章，L3 多重检验 N 输入）

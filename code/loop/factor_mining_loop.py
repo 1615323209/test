@@ -48,7 +48,11 @@ def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None):
             continue
         append_csv(STATE_DIR / "l1_log.csv", {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "batch": batch_id, "idx": idx, "name": cand["name"],
-                   "icir": cand["ic_metrics"].get("icir"), "status": "L1通过"})
+                   "icir": cand["ic_metrics"].get("icir"),
+                   "t_nw_design": cand.get("t_nw_design"), "t_nw_holdout": cand.get("t_nw_holdout"),
+                   "icir_tradable": cand.get("icir_tradable"),
+                   "n_peek": cand.get("n_peek"), "role": cand.get("role", "score"),
+                   "gate": "g0-g4", "status": "L1通过"})
         ok, why, cand2 = l2_pipeline(cand, pool_exprs, api_key)
         if not ok:
             append_csv(STATE_DIR / "l2_log.csv", {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -59,6 +63,17 @@ def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None):
         cand2["added_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         if cand2.get("archived_only"):
             cand2["status"] = "档案"  # role != score：只登记档案，不进打分池、不触发 L3（L2 文档第七章）
+        # IC 序列外置（L1 文档缺陷 14）：不随 checkpoint 膨胀，落盘 ic_series/{hash}.parquet
+        ic_series = (cand2.get("ic_metrics") or {}).pop("_ic_series", None)
+        if ic_series:
+            try:
+                import polars as _pl
+                sdir = Path(r"D:\quant_data\loop_state\ic_series")
+                sdir.mkdir(parents=True, exist_ok=True)
+                _pl.DataFrame({"ic": list(ic_series)}).write_parquet(sdir / f"{cand2['expr_hash']}.parquet")
+                cand2["ic_series_path"] = f"loop_state/ic_series/{cand2['expr_hash']}.parquet"
+            except Exception:
+                pass
         pool.append(cand2)
         pool_exprs.append({"expr": cand2["expr"], "expr_hash": cand2["expr_hash"], "name": cand2["name"]})
         added += 1
@@ -169,6 +184,30 @@ def run_l4(ck, paper_file=None, verbose=True):
             p["status"] = "观察"
     return len([p for p in pool if p["status"] == "实盘确认"])
 
+def gate_audit(verbose=True):
+    """工程保障门禁有效性自检（工程保障.md 第六章）：
+    统计 L1/L2 通过率，出现"恒 100% 从未拒绝"即告警（假门禁比没有门禁更危险）"""
+    import csv as _csv
+    alerts = []
+    for name, fname, ok_status in [("L1", "l1_log.csv", "L1通过"), ("L2", "l2_log.csv", "入池")]:
+        p = STATE_DIR / fname
+        if not p.exists():
+            continue
+        try:
+            rows = list(_csv.DictReader(open(p, encoding="utf-8")))
+        except Exception:
+            continue
+        if len(rows) >= 20:
+            ok_n = sum(1 for r in rows if r.get("status") == ok_status)
+            rate = ok_n / len(rows)
+            if rate == 1.0:
+                alerts.append(f"{name} 通过率恒 100%（{len(rows)}次从未拒绝）→ 假门禁风险")
+            elif verbose:
+                print(f"[audit] {name} 通过率 {rate:.0%} ({ok_n}/{len(rows)})")
+    if alerts:
+        print("[audit] ⚠️ " + " | ".join(alerts))
+    return alerts
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=1, help="跑几批（每批5候选）")
@@ -234,6 +273,7 @@ def main():
                 l4 = list(csv.DictReader(f))
         dash = update_dashboard(ck["pool"], hist, l4)
         print(f"[dash] 健康分={dash['health_score']} 池={dash['pool_size']} 启用={dash['enabled']}")
+        gate_audit()  # 门禁有效性自检（工程保障.md）
         print("[done] loop 完成")
     finally:
         lock.release()
