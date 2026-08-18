@@ -145,6 +145,53 @@ def backfill_and_stats():
                 hit = (valid > 0).mean() * 100
                 avg = valid.mean() * 100
                 print(f"  后续{h}日: 样本{len(valid)} | 命中率(涨){hit:.0f}% | 均值{avg:+.2f}%")
+
+    # ===== 因子归因分析（哪个因子选出的股表现好） =====
+    print("=" * 46)
+    print("因子归因分析（按归因因子分组：哪个因子靠谱）")
+    print("=" * 46)
+    # 用 5 日涨幅作为表现基准（有足够数据时），否则 1 日
+    bench_col = "ret_5d" if out["ret_5d"].notna().sum() >= 5 else "ret_1d"
+    if "factors" in out.columns and bench_col in out.columns:
+        fac_rows = []
+        for _, r in out.iterrows():
+            fac = str(r.get("factors") or "").strip()
+            if not fac or fac == "nan":
+                continue
+            ret = r.get(bench_col)
+            if pd.notna(ret):
+                for fname in [x.strip() for x in fac.split("|") if x.strip()]:
+                    fac_rows.append({"factors": fname, "ret": float(ret), "hit": float(ret) > 0})
+        if fac_rows:
+            fdf = pd.DataFrame(fac_rows)
+            # 按因子聚合
+            agg = fdf.groupby("factors").agg(
+                样本=("ret", "size"), 命中率=("hit", "mean"), 均值=("ret", "mean"))
+            agg = agg[agg["样本"] >= 2].sort_values("均值", ascending=False)
+            # 评估
+            for fac, rows2 in agg.iterrows():
+                avg = rows2["均值"] * 100
+                hit = rows2["命中率"] * 100
+                if avg > 1.0 and hit >= 50:
+                    tag = "✅靠谱，可维持或加权重"
+                elif avg < -1.0:
+                    tag = "⚠️待观察，历史表现差，建议减权重/淘汰"
+                else:
+                    tag = "中性"
+                print(f"  {fac:8} 样本{int(rows2['样本'])} | 命中率{hit:.0f}% | 均值{avg:+.2f}% | {tag}")
+        else:
+            print("  (归因样本不足)")
+
+    # 失败复盘：跌最多的选股
+    print("=" * 46)
+    print("失败复盘（后续跌幅最大，分析原因）")
+    print("=" * 46)
+    if bench_col in out.columns:
+        worst = out[out[bench_col].notna()].sort_values(bench_col).head(3)
+        for _, r in worst.iterrows():
+            print(f"  {r['code']} | 选入{r['sel_price']} | 后续{bench_col.replace('ret_','')}日{float(r[bench_col])*100:+.1f}% | 归因={r.get('factors','-')}")
+    print("  注: 单日样本少(短线<7天)时结论仅供参考，积累更多选股样本才有统计意义")
+
     # 盯盘提醒
     print("=" * 46)
     print("盯盘提醒（后续涨跌超阈值）")
