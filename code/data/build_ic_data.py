@@ -49,14 +49,16 @@ def main():
         (pl.col("收盘").shift(-10) / pl.col("收盘") - 1).over("股票代码").alias("fwd_10d"),
         (pl.col("收盘").shift(-20) / pl.col("收盘") - 1).over("股票代码").alias("fwd_20d"),
     ])
-    # 自检：fwd_5d 应 ≈ ret_5d.shift(-5)（同股票分组下前 5 日累计收益）
-    chk = d.with_columns(pl.col("ret_5d").shift(-5).over("股票代码").alias("ret_5d_lead"))
-    diff = chk.filter(pl.col("fwd_5d").is_not_null() & pl.col("ret_5d_lead").is_not_null())
+    # 自检：fwd_1d 应 ≈ ret_1d.shift(-1)（同为单日收益率，定义一致才可比；
+    # 注意 fwd_5d 是几何收益(close.shift(-5)/close-1)，ret_5d 是算术和(rolling_sum)，
+    # 二者数学上不相等，不能直接比）
+    chk = d.with_columns(pl.col("ret_1d").shift(-1).over("股票代码").alias("ret_1d_lead"))
+    diff = chk.filter(pl.col("fwd_1d").is_not_null() & pl.col("ret_1d_lead").is_not_null())
     if len(diff) > 1000:
-        max_diff = float((diff["fwd_5d"] - diff["ret_5d_lead"]).abs().max())
-        if max_diff > 1e-6:
-            raise RuntimeError(f"fwd_5d 自检失败: max diff={max_diff:.2e}")
-        print(f"[4] fwd_* 已重算（自检通过, max_diff={max_diff:.1e}）")
+        max_diff = float((diff["fwd_1d"] - diff["ret_1d_lead"]).abs().max())
+        if max_diff > 1e-4:  # fwd_1d 与 ret_1d 同为单日收益，应数值一致（容差 1e-4）
+            raise RuntimeError(f"fwd_1d 自检失败: max diff={max_diff:.2e}")
+        print(f"[4] fwd_* 已重算（自检通过: fwd_1d≈ret_1d.shift(-1), max_diff={max_diff:.1e}）")
     else:
         print("[4] fwd_* 已重算（样本不足无法自检）")
 
