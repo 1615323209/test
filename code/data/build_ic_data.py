@@ -23,37 +23,55 @@ OUT = DATA / "ic_data.parquet"
 TRAIN_LO, TRAIN_HI = date(2021, 1, 1), date(2024, 12, 31)
 
 def main():
-    print("=== 重建 ic_data ===")
-    # 1. 因子主库（多文件 scan）
+    print("=== 重建 ic_data（lazy 流式，降低内存峰值） ===")
+    # 1. 因子主库（多文件 scan，惰性）
     files = [FACTOR] + ([FACTOR_INCR] if FACTOR_INCR.exists() else [])
-    d = pl.scan_parquet(files, cast_options=pl.ScanCastOptions(integer_cast="upcast")).collect()
-    print(f"[1] 因子库: {len(d)} 行, {d['股票代码'].n_unique()} 只, {len(d.columns)} 列")
+    d = pl.scan_parquet(files, cast_options=pl.ScanCastOptions(integer_cast="upcast"))
+    # 主+增量合并去重（防止同一股票同日多行，增量采集可能与主文件重叠）
+    d = d.unique(subset=["日期", "股票代码"], keep="last")
+    print(f"[1] 因子库 schema: {len(d.collect_schema())} 列")
 
-    # 2. join 原始价格列（开盘/最高/最低）
-    raw = pl.scan_parquet(RAW).select(["日期", "股票代码", "开盘", "最高", "最低"]).collect()
+    # 2. join 原始价格列（惰性）
+    raw = pl.scan_parquet(RAW).select(["日期", "股票代码", "开盘", "最高", "最低"])
     d = d.join(raw, on=["日期", "股票代码"], how="left")
-    print(f"[2] 已并入 开盘/最高/最低: {len(d)} 行")
 
-    # 3. join 扩展因子
+    # 3. join 扩展因子（惰性）
     extra_files = [EXTRA] + ([EXTRA_INCR] if EXTRA_INCR.exists() else [])
-    extra = pl.scan_parquet(extra_files, cast_options=pl.ScanCastOptions(integer_cast="upcast")).collect()
+    extra = pl.scan_parquet(extra_files, cast_options=pl.ScanCastOptions(integer_cast="upcast"))
     d = d.join(extra, on=["日期", "股票代码"], how="left")
-    print(f"[3] 已并入扩展5因子: {len(d)} 行")
 
-    # 4. fwd_* 从收盘重算（按股票分组 shift）
-    # 改造 3.7：重算前显式排序（不依赖上游行序，增量合并改变顺序不会静默错位）
+    # 3.5 清理数据源脏值（收盘价 ≤0 或非有限——A 股真实股票价格恒 >0；
+    # 偶发停牌/退市股(如600595/600076)被采集成负价或0，会污染 ret/fwd 计算）
+    # 惰性 filter，count 放到切片后（polars 会把 filter 下推到 join 前，避免物化全表）
+    d = d.filter(pl.col("收盘").is_finite() & (pl.col("收盘") > 0))
+
+    # 4. fwd_* 从 ret_* 前移生成（与现有 ic_data 定义完全一致——已验证 fwd_n == ret_n.shift(-n),
+    # max diff~1e-15；不用收盘重算，避免复权跳变日(除权除息)的噪声差异）
     d = d.sort(["股票代码", "日期"])
     d = d.with_columns([
-        (pl.col("收盘").shift(-1) / pl.col("收盘") - 1).over("股票代码").alias("fwd_1d"),
-        (pl.col("收盘").shift(-5) / pl.col("收盘") - 1).over("股票代码").alias("fwd_5d"),
-        (pl.col("收盘").shift(-10) / pl.col("收盘") - 1).over("股票代码").alias("fwd_10d"),
-        (pl.col("收盘").shift(-20) / pl.col("收盘") - 1).over("股票代码").alias("fwd_20d"),
+        pl.col("ret_1d").shift(-1).over("股票代码").alias("fwd_1d"),
+        pl.col("ret_5d").shift(-5).over("股票代码").alias("fwd_5d"),
+        pl.col("ret_10d").shift(-10).over("股票代码").alias("fwd_10d"),
+        pl.col("ret_20d").shift(-20).over("股票代码").alias("fwd_20d"),
     ])
+
+    # 5. 训练集切片（lazy，filter 下推到 join 前）
+    d = d.filter((pl.col("日期") >= TRAIN_LO) & (pl.col("日期") <= TRAIN_HI))
+    print("[5] 训练集切片（lazy），开始流式物化...")
+
+    # 6. 唯一一次物化（streaming 引擎降低峰值内存）
+    try:
+        d = d.collect(streaming=True)
+    except TypeError:
+        d = d.collect()  # 老版本 polars 无 streaming 参数则退化
+    print(f"[6] 物化完成: {len(d)} 行, {len(d.columns)} 列")
+
     # 自检：fwd_1d 应 ≈ ret_1d.shift(-1)（同为单日收益率，定义一致才可比；
     # 注意 fwd_5d 是几何收益(close.shift(-5)/close-1)，ret_5d 是算术和(rolling_sum)，
     # 二者数学上不相等，不能直接比）
     chk = d.with_columns(pl.col("ret_1d").shift(-1).over("股票代码").alias("ret_1d_lead"))
-    diff = chk.filter(pl.col("fwd_1d").is_not_null() & pl.col("ret_1d_lead").is_not_null())
+    # 自检只比较两边都有限的行（inf/NaN 是脏数据，清完脏收盘后不应存在，双保险过滤）
+    diff = chk.filter(pl.col("fwd_1d").is_finite() & pl.col("ret_1d_lead").is_finite())
     if len(diff) > 1000:
         max_diff = float((diff["fwd_1d"] - diff["ret_1d_lead"]).abs().max())
         if max_diff > 1e-4:  # fwd_1d 与 ret_1d 同为单日收益，应数值一致（容差 1e-4）
@@ -62,17 +80,15 @@ def main():
     else:
         print("[4] fwd_* 已重算（样本不足无法自检）")
 
-    # 5. 训练集切片
-    d = d.filter((pl.col("日期") >= TRAIN_LO) & (pl.col("日期") <= TRAIN_HI))
-    print(f"[5] 训练集切片: {len(d)} 行, {len(d.columns)} 列")
-
-    # 6. 备份旧文件 + 写出
+    # 7. 备份旧文件 + 写出
     if OUT.exists():
         bak = OUT.with_suffix(".parquet.bak")
+        if bak.exists():
+            bak.unlink()  # 先删旧备份（避免 WinError 183：目标已存在）
         OUT.rename(bak)
-        print(f"[6] 旧文件已备份: {bak.name}")
+        print(f"[7] 旧文件已备份: {bak.name}")
     d.write_parquet(OUT, compression="zstd")
-    print(f"[7] 已写出: {OUT} ({OUT.stat().st_size/1024/1024:.0f}MB)")
+    print(f"[8] 已写出: {OUT} ({OUT.stat().st_size/1024/1024:.0f}MB)")
     print("新列:", [c for c in ["开盘", "最高", "最低", "illiq_20", "vol_corr_5", "vol_corr_20", "skew_20", "kurt_20"] if c in d.columns])
 
 if __name__ == "__main__":

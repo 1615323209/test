@@ -144,6 +144,8 @@ def main():
     df = df.select(need_cols).with_columns(
         pl.col('limit_up').rolling_sum(5, min_samples=5).over('股票代码').alias('limit_up_5d')
     ).collect()
+    # 数据修复：主文件+增量合并可能有重复（同一股票同日多行），去重保留最后一条
+    df = df.unique(subset=["日期", "股票代码"], keep="last")
     df = df.filter(pl.col('日期') == target)
     
     cand = df.filter(
