@@ -108,8 +108,8 @@ def l3_evaluate(cand, cumulative_tested, extra_factors=None, verbose=True):
         "train": train_m, "valid": valid_m,
         "train_gain": round(train_gain, 2), "valid_gain": round(valid_gain, 2),
         "seg": {
-            "design_2021_2023": round(seg_design["total_ret_pct"], 2),
-            "holdout_2024": round(seg_2024["total_ret_pct"], 2),
+            "design_2021_2023": seg_design,  # 改造2.0缺陷1：已是float，直接写（原 dict 下标 TypeError）
+            "holdout_2024": seg_2024,
             "valid_2025_2026": round(valid_m["total_ret_pct"], 2),
             "note": "2024 已被 L1 用作 G4 内层留出，非独立 OOS",
         },
@@ -181,20 +181,23 @@ def l4_evaluate(factor, paper_trades, sigma_prior=None, verbose=True):
     min_n = 5 if short_lived else 10
     if n < min_n:
         return "观察", {"n": n, "min_n": min_n, "reason": f"样本不足({n}<{min_n}笔)", "bad_rows": bad_rows}
+    # 改造2.0缺陷6：量纲统一——rets 从 live_trades 读的是小数(如0.072)，统一 ×100 为百分比，
+    # 与 expected(百分数) 同量纲，避免 dev 算出 ≈-98% 的假偏差
+    rets = [r * 100.0 for r in rets]
     # 预期基准：降级验证因子 → 0
     expected = factor.get("l4_expected", 0.0)
     if factor.get("degraded_enabled"):
         expected = 0.0
-    # SPRT（2.3: 明确 sigma 优先级，避免靠 Python 运算符优先级碰巧成立）
+    # SPRT（2.3: 明确 sigma 优先级；量纲统一为百分比后 mu1 直接传 expected）
     if sigma_prior is not None and sigma_prior > 0:
         sigma = sigma_prior
     elif len(rets) > 1:
         sigma = max(float(np.std(rets)), 0.01)
     else:
         sigma = 0.02
-    decision, lnLR = sprt_decision(rets, expected / 100.0, sigma=sigma)
+    decision, lnLR = sprt_decision(rets, expected, sigma=sigma)  # mu1 百分数（与 rets 同量纲）
     # 偏差检测（绝对值地板 2%）
-    realized = np.mean(rets) if rets else 0
+    realized = float(np.mean(rets)) if rets else 0.0
     exp_pct = expected
     denom = max(abs(exp_pct), 2.0)
     dev = (realized - exp_pct) / denom * 100

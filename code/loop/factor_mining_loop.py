@@ -28,8 +28,9 @@ from loop import factor_loop_l1l2 as L1L2
 from loop.factor_loop_l3l4 import l3_evaluate, calc_weights, update_dashboard, BASELINE
 from loop.llm_factor_synth import load_deepseek_key, build_dict
 
-def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None):
-    """L2 批次：生成 n_cands 个候选 → L1 → L2 → 入池（每候选处理完即保存检查点）"""
+def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None, budget_sec=None):
+    """L2 批次：生成 n_cands 个候选 → L1 → L2 → 入池（每候选处理完即保存检查点）
+    改造2.0 3.1：budget_sec 预算驱动——每候选检查剩余预算，不足单候选历史 P80 耗时则 stop（exit_reason=budget）"""
     if smoke:
         n_cands = 1
     batch_id = ck.get("batch_id", 0) + 1
@@ -41,7 +42,16 @@ def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None):
         for p in pool[-10:]) or "（池为空，自由选择主题）"
     ddict = build_dict()
     added = 0
+    exit_reason = "done"
+    # 改造2.0 3.1：预算驱动——单候选历史 P80 耗时（默认 240s，后续由 run_summary 校准）
+    est_per_cand = ck.get("cand_p80_sec", 240)
+    t_run = time.time()
     for idx in range(n_cands):
+        # 预算检查：不足再跑一个候选的预估耗时 → 停止并标记 budget
+        if budget_sec and (time.time() - t_run) + est_per_cand > budget_sec:
+            print(f"  [预算] 剩余预算不足单候选 P80({est_per_cand}s)，停止取新候选")
+            exit_reason = "budget"
+            break
         if verbose:
             print(f"  [L1] batch{batch_id} 候选{idx}...")
         cand = l1_refine(batch_id, idx, api_key, ddict, max_rounds=3, smoke=smoke, pool_topics=pool_topics)
@@ -84,6 +94,7 @@ def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None):
         if ck_mgr: ck_mgr.save(ck)
     ck["batch_id"] = batch_id
     ck["pool"] = pool
+    ck["last_exit_reason"] = exit_reason  # 改造2.0 3.1：预算驱动标记
     return added
 
 def run_l3(ck, verbose=True):
@@ -122,8 +133,14 @@ def run_l3(ck, verbose=True):
         if status == "启用":
             cand["status"] = "启用"
             cand["degraded_enabled"] = report.get("valid_degraded", False)
+            # 改造2.0缺陷2+2.3：l4_expected 必须由 L3 写入（否则 μ1=μ0=0 → SPRT 恒观察）
+            # 正常启用：预期单笔收益 = 该因子注入后 train 回测总收益 / 笔数
+            # 降级启用（验证集<20笔）：写 0.0 保守口径
             if report.get("valid_degraded"):
                 cand["l4_expected"] = 0.0
+            else:
+                t_ret = train_m_per_cand(report.get("train"))
+                cand["l4_expected"] = t_ret
             n_enabled += 1
         else:
             cand["status"] = "回滚"
@@ -137,6 +154,13 @@ def run_l3(ck, verbose=True):
             p["status"] = "启用"  # 从候选转启用后保持
     ck["cumulative_tested"] = N
     return n_enabled
+
+def train_m_per_cand(train_m):
+    """改造2.0缺陷2：单笔预期收益 = train 回测总收益 / 笔数（百分比）"""
+    if not train_m:
+        return 0.0
+    n = train_m.get("n_trades", 1) or 1
+    return round(float(train_m.get("total_ret_pct", 0.0)) / n, 3)
 
 def run_l4(ck, paper_file=None, verbose=True):
     """L4 实盘验证评估（真实成交驱动；L4 文档缺陷 3 修复：不再默认读模拟盘 paper_trades.csv）"""
@@ -227,6 +251,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=1, help="跑几批（每批5候选）")
     ap.add_argument("--n-cands", type=int, default=5, help="每批候选数（cron 用小值控制在超时内）")
+    ap.add_argument("--budget-sec", type=int, default=None, help="改造2.0 3.1：总预算秒数（默认无；cron 用 420）")
     ap.add_argument("--smoke", action="store_true", help="快速验证：1批1候选")
     ap.add_argument("--l4-only", action="store_true", help="只跑 L4")
     ap.add_argument("--status", action="store_true", help="查看状态")
@@ -263,7 +288,8 @@ def main():
             run_l4(ck)
         else:
             for b in range(args.batch):
-                added = run_batch(ck, api_key, n_cands=args.n_cands, smoke=args.smoke, ck_mgr=ck_mgr)
+                added = run_batch(ck, api_key, n_cands=args.n_cands, smoke=args.smoke,
+                                  ck_mgr=ck_mgr, budget_sec=args.budget_sec)
                 print(f"[L2] 批 {ck['batch_id']}: 新增 {added} 个候选")
                 # 批完成后触发 L3（候选≥1 且非 smoke 时）
                 if not args.smoke and added > 0:

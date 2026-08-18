@@ -114,7 +114,7 @@ def main():
             elif VAL_LO <= dt <= VAL_HI:
                 valid_x.append(xx); valid_y.append(yw[j]); valid_meta.append((dt.isoformat(), code))
         if (i + 1) % 1000 == 0:
-            print(f"  {i+1}/{n_stocks} 只完成, design={len(design_y)}, holdout={len(holdout_y)}, valid={len(valid_y)}, {time.time()-t0:.0f}s")
+            print(f"  {i+1}/{n_stocks} 只完成, dl_train={len(dl_train_y)}, dl_val={len(dl_val_y)}, holdout={len(holdout_y)}, valid={len(valid_y)}, {time.time()-t0:.0f}s")
 
     # 4. 写盘
     print("[4/4] 写盘...")

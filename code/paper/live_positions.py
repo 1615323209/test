@@ -55,6 +55,25 @@ def cmd_status(args):
         print(line)
     print(f"总成本 {total_cost:.0f} 元 / 上限 {MAX_POSITIONS*MAX_AMOUNT:.0f} 元")
 
+def load_pick_factors(code, d):
+    """改造2.0缺陷3/2.2：从当天 picks 文件按代码带出 top_factors 归因"""
+    try:
+        import polars as _pl
+        picks_dir = DATA / "daily_picks"
+        # 找最新 picks 文件（优先当日，回退最近）
+        cands = sorted(picks_dir.glob(f"picks_{d}.csv")) or sorted(picks_dir.glob("picks_*.csv"))
+        if not cands:
+            return ""
+        pf = _pl.read_csv(cands[-1])
+        row = pf.filter(_pl.col("股票代码") == code)
+        if row.height == 0 and "代码" in pf.columns:
+            row = pf.filter(_pl.col("代码") == code)
+        if row.height > 0 and "top_factors" in pf.columns:
+            return str(row["top_factors"][0])
+        return ""
+    except Exception:
+        return ""
+
 def cmd_add(args):
     pos = load()
     if len(pos) >= MAX_POSITIONS:
@@ -72,22 +91,31 @@ def cmd_add(args):
     if shares <= 0:
         print("金额不足一手(100股)。")
         return 1
+    # 改造2.0缺陷3/2.2：--from-pick 从 picks 带出 top_factors 归因；手工加仓写 manual
+    factor = ""
+    if args.from_pick:
+        factor = load_pick_factors(code, d)
+        if not factor:
+            print(f"  （{code} 未在 {d} picks 中找到 top_factors，factor 留空）")
+    else:
+        factor = "manual"
     pos.append({"code": code, "name": "", "cost": cost, "shares": shares,
-                "amount": cost * shares, "date": d})
+                "amount": cost * shares, "date": d, "factor": factor})
     save(pos)
-    print(f"已记录买入: {code} 成本{cost:.2f} x{shares}股 = {cost*shares:.0f}元 ({d})")
+    print(f"已记录买入: {code} 成本{cost:.2f} x{shares}股 = {cost*shares:.0f}元 ({d}) factor={factor}")
     print(f"当前 {len(pos)}/{MAX_POSITIONS} 只，剩余仓位 {MAX_POSITIONS*MAX_AMOUNT - sum(p['amount'] for p in pos):.0f} 元")
     return 0
 
-def record_trade(code, cost, price, shares, d):
-    """记录真实成交到 live_trades.csv（L4 SPRT 数据源，L4 文档缺陷 3 配套）"""
+def record_trade(code, cost, price, shares, d, factor=""):
+    """记录真实成交到 live_trades.csv（L4 SPRT 数据源，L4 文档缺陷 3 配套）
+    改造2.0：factor 列写入归因（多因子用 | 分隔），不再恒空"""
     pnl_pct = (price - cost) / cost
     new = not TRADES.exists()
     with open(TRADES, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if new:
             w.writerow(["date", "code", "cost", "price", "shares", "pnl_pct", "factor"])
-        w.writerow([d, code, cost, price, shares, round(pnl_pct, 4), ""])
+        w.writerow([d, code, cost, price, shares, round(pnl_pct, 4), factor])
     return pnl_pct
 
 def cmd_sell(args):
@@ -116,8 +144,10 @@ def cmd_sell(args):
         pos.remove(p)
         print(f"已清仓 {code}（{d}）。")
     if price and sold_shares > 0:
-        pnl = record_trade(code, p["cost"], price, sold_shares, d)
-        print(f"已记录成交: {code} 成本{p['cost']:.2f}→卖{price:.2f} 盈亏{pnl:+.2%}")
+        # 改造2.0缺陷3：卖单的 factor 归因从持仓记录带出（买入时 --from-pick 写入的）
+        factor = p.get("factor", "manual")
+        pnl = record_trade(code, p["cost"], price, sold_shares, d, factor)
+        print(f"已记录成交: {code} 成本{p['cost']:.2f}→卖{price:.2f} 盈亏{pnl:+.2%} factor={factor}")
     else:
         print(f"（未提供卖出价，未记录成交；可在盘中监控时补记）")
     save(pos)
@@ -128,6 +158,8 @@ def main():
     ap.add_argument("--status", nargs="?", const="", help="查看持仓（可选 代码:现价,代码:现价）")
     ap.add_argument("--add", nargs="+", help="买入: 代码 成本价 金额 [日期]")
     ap.add_argument("--sell", nargs="+", help="卖出: 代码 [股数|all] [日期]")
+    ap.add_argument("--from-pick", action="store_true",
+                    help="改造2.0：买入时从当天 picks 带出 top_factors 归因（手工加仓不传则写 manual）")
     a = ap.parse_args()
     if a.add:
         return cmd_add(a)

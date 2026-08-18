@@ -13,7 +13,6 @@
     expr, err = safe_compile(expr_str)   # expr 为 polars Expr 或 None
 """
 import ast
-import re
 import polars as pl
 
 # ---------- 算子白名单（单一来源，同时用于校验与 prompt 生成） ----------
