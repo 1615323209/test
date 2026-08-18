@@ -17,8 +17,8 @@ def run(cmd, timeout=540):
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(cmd, 124, stdout="", stderr="子进程超时")
 
-# 跑一批
-r1 = run([PY, "-m", "loop.factor_mining_loop", "--batch", "1"])
+# 跑一批（cron 每 2 小时 2 个候选，约 8-12 分钟，控制在 540s 子进程预算内）
+r1 = run([PY, "-m", "loop.factor_mining_loop", "--batch", "1", "--n-cands", "2"])
 print(r1.stdout[-2000:] or "(无输出)")
 if r1.stderr:
     print("STDERR:", r1.stderr[-1000:])

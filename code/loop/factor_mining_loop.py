@@ -215,6 +215,7 @@ def gate_audit(verbose=True):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=1, help="跑几批（每批5候选）")
+    ap.add_argument("--n-cands", type=int, default=5, help="每批候选数（cron 用小值控制在超时内）")
     ap.add_argument("--smoke", action="store_true", help="快速验证：1批1候选")
     ap.add_argument("--l4-only", action="store_true", help="只跑 L4")
     ap.add_argument("--status", action="store_true", help="查看状态")
@@ -251,7 +252,7 @@ def main():
             run_l4(ck)
         else:
             for b in range(args.batch):
-                added = run_batch(ck, api_key, smoke=args.smoke, ck_mgr=ck_mgr)
+                added = run_batch(ck, api_key, n_cands=args.n_cands, smoke=args.smoke, ck_mgr=ck_mgr)
                 print(f"[L2] 批 {ck['batch_id']}: 新增 {added} 个候选")
                 # 批完成后触发 L3（候选≥1 且非 smoke 时）
                 if not args.smoke and added > 0:
