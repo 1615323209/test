@@ -190,6 +190,20 @@ def main():
     
     scored, active_factors, fallback = compute_score(cand)
     top = scored.sort('score', descending=True).head(5)
+    # 新闻情绪因子（方案1：个股公告关键词情绪，作为第6加分维度）
+    # 对 Top5 拉近期公告，情绪分叠加到评分（[-0.05,+0.05] 权重微调）
+    senti_map = {}
+    try:
+        from data.news_sentiment import sentiment as _sent
+        for r0 in top.iter_rows(named=True):
+            c = r0['股票代码']
+            try:
+                sc, p, n, _an = _sent(c)
+                senti_map[c] = sc
+            except Exception:
+                senti_map[c] = 0.0
+    except Exception:
+        pass
     # 改造2.0 2.2：每只入选股算 top_factors 贡献归因（s_i × weight 排序取前2）
     fa_cols = [f"__{f['name']}" for f in active_factors]
     if fa_cols:
@@ -212,20 +226,25 @@ def main():
             top_factors = "|".join(n for n, _ in contribs[:2])
         except Exception:
             top_factors = ""
+        senti = senti_map.get(code, 0.0)
+        # 情绪分微调评分（[-0.05,+0.05]：负情绪降权，正情绪加权）
+        adj_score = round(float(r['score']) + senti * 10.0, 1)
         rows.append({
             '排名': len(rows)+1, '代码': code, '收盘': round(price,2),
-            '评分': round(float(r['score']),1),
+            '评分': adj_score,
             '可买股数': shares if shares >= 100 else '不足100股',
             'ret_5d': round(r['ret_5d'],3), 'vol_ratio': round(r['vol_ratio'],2),
             'turn_ratio': round(r['turn_ratio'],2),
             '近5日涨停': int(r['limit_up_5d']),
             '站上MA20': round(r['ma_20'],2), 'price_pos': round(r['price_pos_20'],2),
             'top_factors': top_factors,  # 改造2.0 2.2：归因（供 --from-pick / L4）
+            '新闻情绪': round(senti, 2),  # 新闻情绪因子
         })
+        s_tag = ("🔴利空" if senti < -0.3 else ("🟢利好" if senti > 0.3 else "中性"))
         print(f"  {rows[-1]['排名']}. {_cname(code)} ({code})  收盘{price:.2f}  评分{rows[-1]['评分']}  "
               f"{'可买'+str(shares)+'股' if shares>=100 else '不足100股'}")
         print(f"     ret_5d={r['ret_5d']:.3f} vol={r['vol_ratio']:.2f} turn={r['turn_ratio']:.2f} "
-              f"涨停5d={int(r['limit_up_5d'])} pos={r['price_pos_20']:.2f} 归因={top_factors}")
+              f"涨停5d={int(r['limit_up_5d'])} pos={r['price_pos_20']:.2f} 归因={top_factors} 新闻情绪{senti:+.2f}{s_tag}")
     if fallback:
         print("\n⚠️ 使用 v7 基线回退（active_factors 不可用）")
 
