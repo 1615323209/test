@@ -27,7 +27,8 @@ def get_vec(expr, df=None, days=None, force=False):
     p = _path(h)
     if p.exists() and not force:
         try:
-            return np.load(p)
+            v = np.load(p)
+            return _check_vec(v, expr)
         except Exception:
             pass
     # 计算：设计段全样本 rank（按日期分组）
@@ -39,9 +40,28 @@ def get_vec(expr, df=None, days=None, force=False):
             raise ValueError(f"向量缓存表达式沙箱拒绝: {err}")
         expr = ex
     vec = df.with_columns(expr.rank().over("日期").alias("_v"))["_v"].to_numpy().astype(np.float32)
-    np.save(p, vec)
-    _evict()
-    return vec
+    try:
+        np.save(p, vec)
+        _evict()
+    except Exception:
+        pass
+    return _check_vec(vec, expr)
+
+
+def _check_vec(vec, expr=None):
+    """改造2.0防护：向量质量校验——空/全NaN/全零 → 抛错（不静默返回坏向量，
+    否则 l2 会用坏数据算出 cond=0/残差0 误杀或误放行）"""
+    import numpy as _np
+    v = _np.asarray(vec)
+    if v.size == 0:
+        raise ValueError(f"向量为空: {str(expr)[:40] if expr else '?'}")
+    finite = _np.isfinite(v)
+    if finite.sum() < max(1000, v.size * 0.01):
+        raise ValueError(f"向量有效样本过少(finite={finite.sum()}/{v.size}): {str(expr)[:40] if expr else '?'}")
+    nz = _np.abs(v[finite])
+    if nz.size and nz.max() < 1e-9:
+        raise ValueError(f"向量全零(rank 退化): {str(expr)[:40] if expr else '?'}")
+    return v
 
 def get_indices(df=None):
     """设计段行索引（与向量对齐）"""

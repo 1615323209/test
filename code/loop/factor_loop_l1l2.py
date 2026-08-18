@@ -365,7 +365,12 @@ def l2_dedup(expr, pool_exprs, df=None):
         from loop.factor_loop_l1l2 import load_design_df as _ldd
         df_full = df if df is not None else _ldd()
         dates = df_full["日期"].to_list()
-        cand_vec = get_vec(expr, df=df_full)
+        try:
+            cand_vec = get_vec(expr, df=df_full)
+        except Exception as _ce:
+            # 改造2.0防护：候选向量异常→明确拒绝（不静默放行，否则坏向量会漏过去重）
+            print(f"    [L2去重] ⚠️ 候选向量异常: {str(_ce)[:60]} → 拒绝")
+            return False, f"候选向量异常: {str(_ce)[:60]}"
         import pandas as _pd
         cand_frame = _pd.DataFrame({"日期": dates, "_c": cand_vec})
         for p in pool_exprs:
@@ -421,20 +426,32 @@ def l2_orthogonal(expr, base_exprs, df=None):
     try:
         # 改造2.0 3.3：y 与基准 X 都从 vec_cache 拿（纯内存 numpy，不再每晚物化 rank parquet）
         from paper.vec_cache import get_vec
-        y = get_vec(expr, df=df)
+        try:
+            y = get_vec(expr, df=df)
+        except Exception as _ye:
+            # 改造2.0防护：候选向量异常→明确拒绝并落盘（不静默 False,0,0）
+            print(f"    [L2正交化] ⚠️ 候选向量异常: {str(_ye)[:60]} → 拒绝")
+            return False, 0.0, -1
         X_cols = []
         for b in base_exprs:
             be, berr, _ = safe_compile(b)
             if be is None:
                 continue
-            X_cols.append(get_vec(b, df=df))
+            try:
+                X_cols.append(get_vec(b, df=df))
+            except Exception as _be:
+                # 改造2.0防护：基准向量异常→明确失败并落盘可见（不静默跳过，否则基准缺失会误判）
+                print(f"    [L2正交化] ⚠️ 基准向量异常({b[:40]}): {str(_be)[:60]} → 拒绝")
+                return False, 0.0, -1
         if not X_cols:
-            return False, 0.0, 0.0
+            print("    [L2正交化] ⚠️ 无可用基准向量 → 拒绝")
+            return False, 0.0, -1
         X = np.column_stack(X_cols)
         mask = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
         y_m, X_m = y[mask], X[mask]
         if len(y_m) < 10000 or X_m.shape[1] == 0:
-            return False, 0.0, 0.0
+            print(f"    [L2正交化] ⚠️ 有效样本不足({len(y_m)}) → 拒绝")
+            return False, 0.0, -1
         # 条件数（基准内部共线检测）
         Xc = X_m - X_m.mean(axis=0)
         y_c = y_m - y_m.mean()  # 中心化 y（正规方程要求同口径）
