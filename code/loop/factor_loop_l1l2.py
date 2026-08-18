@@ -254,14 +254,14 @@ NON_PRICE_COLS = set()  # 未来放财务/行业列名；当前 45 因子全是�
 
 def validate_expr(expr_str):
     """列名校验 + PIT 检查（L1 文档第六章：AST 沙箱 + fwd_* 黑名单 + 未注册列默认拒）。
+    改造 1.3：消费 safe_compile 返回的 cols（与 AST 校验同源，不再自跑正则——关闭绕过面）。
     返回 (通过与否, 原因)"""
-    # AST 沙箱：算子白名单 + fwd_* 硬黑名单 + 时序算子强制 over + 幻觉列
-    _, err = safe_compile(expr_str)
+    # AST 沙箱：算子白名单 + fwd_* 硬黑名单 + 时序算子强制 over + 幻觉列 + 列清单
+    _, err, cols = safe_compile(expr_str)
     if err:
         return False, err
     valid_cols = set(load_full_ic_cols())
-    used = re.findall(r"pl\.col\(['\"]([^'\"]+)['\"]\)", expr_str)
-    for c in used:
+    for c in cols:
         if c not in valid_cols:
             return False, f"未注册列: {c}"
         if c in NON_PRICE_COLS:
@@ -344,7 +344,7 @@ def l2_dedup(expr, pool_exprs, df=None):
         cand = df.with_columns(expr.alias("_c"))
         for p in pool_exprs:
             try:
-                pe, perr = safe_compile(p["expr"])
+                pe, perr, _ = safe_compile(p["expr"])
                 if pe is None:
                     continue
                 merged = cand.with_columns(pe.alias("_p"))
@@ -395,7 +395,7 @@ def l2_orthogonal(expr, base_exprs, df=None):
              .with_columns(pl.col("_y0").rank().over("日期").alias("_y"))["_y"].to_numpy())
         X_cols = []
         for b in base_exprs:
-            be, berr = safe_compile(b)
+            be, berr, _ = safe_compile(b)
             if be is None:
                 continue
             X_cols.append((df.with_columns(be.alias("_x0"))
@@ -638,8 +638,8 @@ def parse_json(text):
 def l2_pipeline(cand, pool_exprs, api_key, df=None, verbose=True):
     """候选因子过 L2 全管线。返回 (通过与否, 原因, 增强的cand)
     role 分流（L2 文档第二章）：score 走完整管线；exit/timing 只做去重+档案登记"""
-    df = df if df is not None else load_design_df()  # L2 判定口径：设计段 2021-2023（L2 文档第三章）
-    expr, serr = safe_compile(cand["expr"])
+    from loop.expr_sandbox import safe_compile
+    expr, serr, _ = safe_compile(cand["expr"])
     if expr is None:
         return False, f"表达式沙箱拒绝: {serr}", cand
     role = cand.get("role", "score")

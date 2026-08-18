@@ -148,7 +148,7 @@ def l1_gate_pipeline(cand, verbose=True):
         return False, "g0", why, cand
     # 编译表达式
     from loop.expr_sandbox import safe_compile
-    expr, serr = safe_compile(expr_str)
+    expr, serr, _ = safe_compile(expr_str)
     if expr is None:
         return False, "g0", f"沙箱拒绝: {serr}", cand
     # G1 抽样

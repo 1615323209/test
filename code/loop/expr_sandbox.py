@@ -38,6 +38,9 @@ ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow)
 ALLOWED_UNOPS = (ast.USub, ast.UAdd)
 
 # ---------- 列校验 ----------
+REGEX_META = set("^$*?[]|+\\")
+GROUP_KEY = "股票代码"
+
 def is_fwd_col(name: str) -> bool:
     """label 角色列（未来收益），硬黑名单"""
     return name.startswith('fwd_')
@@ -47,98 +50,139 @@ def is_blacklisted_col(name: str) -> bool:
     return name in {'成交量', '成交额', '收盘价', '开盘价', '最高价', '最低价',
                     '收益率', '涨跌幅', '涨幅', 'volume', 'close', 'open'}
 
+def _col_args(call):
+    """pl.col(...) 的参数必须全是纯字面量列名，否则拒（改造 1.3）
+    返回 (names, err)。含正则元字符/非字符串字面量 → 拒"""
+    names = []
+    for a in call.args:
+        if not isinstance(a, ast.Constant) or not isinstance(a.value, str):
+            return None, "pl.col 参数必须是字符串字面量"
+        if REGEX_META & set(a.value):
+            return None, f"禁止正则列选择器: {a.value}"
+        names.append(a.value)
+    if call.keywords:
+        return None, "pl.col 不接受关键字参数"
+    return names, None
+
+def _has_negative_arg(call):
+    """shift 的 args[0] 或 keywords['n'] 为负数（改造 1.3：关键字负 shift 也拦）"""
+    for node in call.args:
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and node.value < 0:
+            return True
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            if isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float)):
+                return True
+    for kw in call.keywords:
+        if kw.arg in ("n", "offset", "periods"):
+            v = kw.value
+            if isinstance(v, ast.Constant) and isinstance(v.value, (int, float)) and v.value < 0:
+                return True
+            if isinstance(v, ast.UnaryOp) and isinstance(v.op, ast.USub):
+                if isinstance(v.operand, ast.Constant) and isinstance(v.operand.value, (int, float)):
+                    return True
+    return False
+
 # ---------- AST 检查 ----------
-def _check_node(node, state):
-    """递归检查 AST 节点。state: {"has_over": bool, "has_timeseries": bool}"""
+def _check_node(node, covered, cols, err_out):
+    """递归检查 AST 节点。
+    covered: 当前最内层 over 的分组键集合（含 '股票代码' 则时序算子可执行；空/None=不在 over 内）
+    cols: 收集到所有 pl.col 列名（供 validate_expr 消费，与校验同源）
+    改造 1.3：列提取与 over 归属全部 AST 化，不再用正则"""
     if isinstance(node, ast.Expression):
-        return _check_node(node.body, state)
+        return _check_node(node.body, covered, cols, err_out)
     if isinstance(node, ast.Constant):
-        # 只允许数字、字符串、None、bool
         if node.value is None or isinstance(node.value, (int, float, str, bool)):
             return None
         return "非常量节点"
     if isinstance(node, ast.Name):
-        # 只允许 pl（模块引用）
         if node.id == 'pl':
             return None
         return f"非法变量: {node.id}"
     if isinstance(node, ast.Attribute):
-        # 属性访问，attr 必须在白名单（value 递归检查）
         if node.attr not in ALLOWED_ATTRS:
             return f"非法算子: {node.attr}"
-        if node.attr in TIME_SERIES_OPS:
-            state["has_timeseries"] = True
-        err = _check_node(node.value, state)
-        return err
+        return _check_node(node.value, covered, cols, err_out)
     if isinstance(node, ast.Call):
-        # 函数调用：func 递归检查（必须是白名单属性），args 逐个检查
-        err = _check_node(node.func, state)
-        if err:
-            return err
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            attr = func.attr
+            if attr == "col":
+                names, err = _col_args(node)
+                if err:
+                    return err
+                for c in names:
+                    if is_fwd_col(c):
+                        return f"引用标签列(前视): {c}"
+                    if is_blacklisted_col(c):
+                        return f"幻觉列名: {c}"
+                cols.extend(names)
+            elif attr == "over":
+                keys = {a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)}
+                if not keys:
+                    return "over() 必须显式给出分组列字面量"
+                # 接收者子树受本次 over 分组覆盖
+                inner_covered = keys if (GROUP_KEY in keys) else covered
+                return _check_node(func.value, inner_covered, cols, err_out)
+            elif attr in TIME_SERIES_OPS:
+                # 时序算子：必须位于覆盖股票分组的 over 内（covered 含 股票代码）
+                if not (isinstance(covered, set) and GROUP_KEY in covered):
+                    return f"时序算子 {attr} 缺少 .over('{GROUP_KEY}')"
+            if attr == "shift" and _has_negative_arg(node):
+                return "禁止负数 shift（未来函数）"
+        # 递归检查 func + args + keywords
+        e = _check_node(func, covered, cols, err_out)
+        if e:
+            return e
         for a in node.args:
-            err = _check_node(a, state)
-            if err:
-                return err
+            e = _check_node(a, covered, cols, err_out)
+            if e:
+                return e
         for kw in node.keywords:
-            err = _check_node(kw.value, state)
-            if err:
-                return err
-        # 如果调用的是 over，标记已有分组
-        if isinstance(node.func, ast.Attribute) and node.func.attr == 'over':
-            state["has_over"] = True
+            e = _check_node(kw.value, covered, cols, err_out)
+            if e:
+                return e
         return None
     if isinstance(node, ast.BinOp):
         if type(node.op) not in ALLOWED_BINOPS:
             return f"非法运算符: {type(node.op).__name__}"
-        err = _check_node(node.left, state)
-        if err:
-            return err
-        return _check_node(node.right, state)
+        e = _check_node(node.left, covered, cols, err_out)
+        if e:
+            return e
+        return _check_node(node.right, covered, cols, err_out)
     if isinstance(node, ast.UnaryOp):
         if type(node.op) not in ALLOWED_UNOPS:
             return f"非法一元运算符: {type(node.op).__name__}"
-        return _check_node(node.operand, state)
+        return _check_node(node.operand, covered, cols, err_out)
     if isinstance(node, ast.Compare):
+        e = _check_node(node.left, covered, cols, err_out)
+        if e:
+            return e
         for c in node.comparators:
-            err = _check_node(c, state)
-            if err:
-                return err
-        err = _check_node(node.left, state)
-        return err
+            e = _check_node(c, covered, cols, err_out)
+            if e:
+                return e
+        return None
     return f"非法语法节点: {type(node).__name__}"
 
 def safe_compile(expr_str: str):
     """安全编译表达式字符串。
 
-    返回 (polars Expr, None) 或 (None, 错误原因 str)。
-    检查项：AST 白名单 / fwd_* 黑名单 / 幻觉列黑名单 / 时序算子必须 over
-    """
+    返回 (polars Expr, None, cols) 或 (None, 错误原因 str, cols)。
+    改造 1.3：列提取/over 归属/负 shift 全部 AST 化（关闭正则绕过面）；
+    cols 与 validate_expr 同源，供未注册列校验消费。"""
     if not expr_str or not isinstance(expr_str, str):
-        return None, "空表达式"
+        return None, "空表达式", []
     try:
         tree = ast.parse(expr_str, mode='eval')
     except SyntaxError as e:
-        return None, f"语法错误: {e.msg}"
-    state = {"has_over": False, "has_timeseries": False}
-    err = _check_node(tree, state)
+        return None, f"语法错误: {e.msg}", []
+    cols = []
+    err = _check_node(tree, None, cols, None)
     if err:
-        return None, err
-    # 列名检查（fwd_* 硬黑名单 + 幻觉黑名单）
-    cols = re.findall(r"pl\.col\(['\"]([^'\"]+)['\"]\)", expr_str)
-    for c in cols:
-        if is_fwd_col(c):
-            return None, f"引用标签列(前视): {c}"
-        if is_blacklisted_col(c):
-            return None, f"幻觉列名: {c}"
-    # 时序算子强制 over
-    if state["has_timeseries"] and not state["has_over"]:
-        return None, "时序算子(rolling_*/shift/diff)必须带 .over('股票代码')"
-    # 禁止负数 shift（未来函数）
-    if re.search(r"shift\(\s*-", expr_str):
-        return None, "禁止负数 shift（未来函数）"
+        return None, err, cols
     # 受限 eval（AST 已白名单，这里双保险）
     try:
         expr = eval(expr_str, {"__builtins__": {}}, {"pl": pl})
-        return expr, None
+        return expr, None, cols
     except Exception as e:
-        return None, f"表达式执行失败: {str(e)[:100]}"
+        return None, f"表达式执行失败: {str(e)[:100]}", cols
