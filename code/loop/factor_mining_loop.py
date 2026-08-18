@@ -351,10 +351,25 @@ def main():
     lock = RunLock()
     if not lock.acquire():
         return
-    # 改造2.0 4.1：run 级事件流（run_start）
+    # 改造2.0 4.1：run 级事件流（run_start）+ 批次5 control.json 人工干预
     from report.run_reporter import log_event, new_run_id, write_summary, write_push_card, read_events
+    from report.control import apply_control, veto_once, write_pause_card
     run_id = new_run_id()
     log_event("run_start", run_id, batch=args.batch, n_cands=args.n_cands, budget=args.budget_sec)
+    # 批次5：读 control.json（paused 检查 + veto 处理），任何生效留痕
+    ctl, ctl_actions = apply_control()
+    if ctl_actions:
+        log_event("control", run_id, actions=ctl_actions)
+    if ctl.get("paused"):
+        hb = write_pause_card(ctl.get("note", ""))
+        print(hb)
+        log_event("run_end", run_id, exit_reason="paused", control=True)
+        return
+    # veto：命中的表达式写已拒绝库（manual_veto）
+    try:
+        veto_once()
+    except Exception as e:
+        print(f"[control] veto 处理失败: {e}")
     t_run_start = time.time()
     try:
         # 数据健康门禁
