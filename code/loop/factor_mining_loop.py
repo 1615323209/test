@@ -275,6 +275,59 @@ def gate_audit(verbose=True):
         print("[audit] ⚠️ " + " | ".join(alerts))
     return alerts
 
+
+def _make_push_card(run_id, ck, dash, exit_reason, alerts, duration_sec=0, verbose=True):
+    """改造2.0 4.2：生成 push_card.md（cron 直接 cat 的最终推送内容）
+    含：漏斗摘要 / 入池 / 启用 / 池状态 / 告警 / 成本。空转折叠一行。"""
+    from report.run_reporter import write_push_card, read_events
+    import datetime as _dt
+    # 本 run 的 gate 事件聚合（从 l1_log.csv：每候选一行的 gate 命中/拒绝；run_log 无逐候选 gate 行）
+    g_rej = {}
+    gen_n = 0
+    try:
+        import csv as _csv
+        lp = STATE_DIR / "l1_log.csv"
+        if lp.exists():
+            for r in _csv.DictReader(open(lp, encoding="utf-8")):
+                gate = r.get("gate", "")
+                # batch 匹配本 run（l1_log 有 batch 字段，但 run_id 无直接关联；退化：聚合本 run 期间新增）
+                if gate and gate != "g0-g4" and gate != "?":
+                    g_rej[f"g{gate}"] = g_rej.get(f"g{gate}", 0) + 1
+                if r.get("status") == "L1通过":
+                    gen_n += 1
+    except Exception:
+        pass
+    # 空转判断：无新增池、无启用、无告警
+    delta_pool = dash["pool_size"]
+    n_enabled = dash["enabled"]
+    is_idle = (delta_pool <= 0 and n_enabled <= 0 and not alerts)
+    pool = ck.get("pool", [])
+    n_gray = sum(1 for p in pool if p.get("status") == "灰度")
+    n_watch = sum(1 for p in pool if p.get("status") == "观察")
+    n_cls = sum(1 for p in pool if p.get("status") == "候选")
+    n_arch = sum(1 for p in pool if p.get("status") == "档案")
+    time_hdr = _dt.datetime.now().strftime("%H:%M")
+    if is_idle:
+        # 空转 run：折叠成一行（感知不疲劳）
+        line = f"【{time_hdr}】{run_id} 空转：生成 {gen_n} 全部止于漏斗（最佳 t_NW 见 dashboard）｜健康 {dash['health_score']}"
+        body = line
+    else:
+        head = f"【因子挖掘 {time_hdr}】{run_id} · {'预算内正常结束' if exit_reason == 'done' else '预算上限'} · {duration_sec}s"
+        # 漏斗摘要
+        gline = "生成 {gen_n} → " + " → ".join(f"g{g.replace('g','')}拒{v}" for g, v in g_rej.items()) if g_rej else f"生成 {gen_n} → 全过/无拦截记录"
+        lines = [head, gline]
+        # 新增启用
+        if n_enabled > 0:
+            lines.append(f"L3 启用 {n_enabled} 个因子 → active_factors（灰度 0.5×权重）")
+        lines.append(f"池：{len(pool)} 个（启用 {n_enabled} / 灰度 {n_gray} / 观察 {n_watch} / 档案 {n_arch}）｜健康分 {dash['health_score']}")
+        body = "\n".join(lines)
+        if alerts:
+            body += "\n⚠️ " + " | ".join(alerts)
+        body += "\n详情：dashboard.html"
+    write_push_card(run_id, body.split("\n"))
+    return body
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=1, help="跑几批（每批5候选）")
@@ -298,12 +351,19 @@ def main():
     lock = RunLock()
     if not lock.acquire():
         return
+    # 改造2.0 4.1：run 级事件流（run_start）
+    from report.run_reporter import log_event, new_run_id, write_summary, write_push_card, read_events
+    run_id = new_run_id()
+    log_event("run_start", run_id, batch=args.batch, n_cands=args.n_cands, budget=args.budget_sec)
+    t_run_start = time.time()
     try:
         # 数据健康门禁
         dh = DataHealth()
         health = dh.scan()
         if not health.get("ok", False):
             print(f"[gate] 数据健康不通过: {health.get('reason', health)}")
+            log_event("alert", run_id, kind="data_health", msg=str(health.get("reason")))
+            write_push_card(run_id, ["⚠️ 数据健康不通过，loop 跳过", f"原因: {health.get('reason')}"])
             return
         print(f"[gate] 数据健康 OK ({health['n_dates']} 交易日)")
         bus = EventBus()
@@ -319,10 +379,14 @@ def main():
                 added = run_batch(ck, api_key, n_cands=args.n_cands, smoke=args.smoke,
                                   ck_mgr=ck_mgr, budget_sec=args.budget_sec)
                 print(f"[L2] 批 {ck['batch_id']}: 新增 {added} 个候选")
+                if added > 0:
+                    log_event("l2", run_id, batch=ck["batch_id"], added=added)
                 # 批完成后触发 L3（候选≥1 且非 smoke 时）
                 if not args.smoke and added > 0:
                     n = run_l3(ck)
                     print(f"[L3] 启用 {n} 个因子")
+                    if n > 0:
+                        log_event("l3", run_id, enabled=n)
                     ck_mgr.save(ck)
             if args.smoke:
                 # smoke 模式也走一次 L3 验证链路
@@ -343,8 +407,25 @@ def main():
                 l4 = list(csv.DictReader(f))
         dash = update_dashboard(ck["pool"], hist, l4)
         print(f"[dash] 健康分={dash['health_score']} 池={dash['pool_size']} 启用={dash['enabled']}")
-        gate_audit()  # 门禁有效性自检（工程保障.md）
+        alerts = gate_audit()  # 门禁有效性自检（工程保障.md）
+        dur = int(time.time() - t_run_start)
+        exit_reason = ck.get("last_exit_reason", "done")
+        # 改造2.0 4.2：生成 run_summary + push_card（loop 自己产出结论，cron 只 cat）
+        log_event("run_end", run_id, exit_reason=exit_reason, duration_sec=dur,
+                  pool=len(ck["pool"]), enabled=dash["enabled"],
+                  health=dash["health_score"], alerts=alerts)
+        write_summary(run_id, {
+            "id": run_id, "duration_sec": dur, "exit_reason": exit_reason,
+            "pool_size": len(ck["pool"]), "enabled": dash["enabled"],
+            "health_score": dash["health_score"], "alerts": alerts,
+            "n_effective": ck.get("cumulative_tested", 0) + ck.get("peek_spent", 0),
+        })
+        _make_push_card(run_id, ck, dash, exit_reason, alerts, duration_sec=dur)
         print("[done] loop 完成")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        log_event("alert", run_id, kind="exception", msg=str(e))
     finally:
         lock.release()
 
