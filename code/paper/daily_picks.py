@@ -116,8 +116,13 @@ def main():
     print(f"沪深300: {hs_close_s} (MA20: {hs_ma20_s}) {hs_pos}")
     north = m.get('北向净买入')
     print(f"北向净买入: {north if north is not None else '无数据'}")
-    conds = sum([hs_above, m['涨停家数'] > 60, north is not None and north > 0])
-    print(f"市场条件满足: {conds}/3 {'✅可操作' if conds >= 2 else '⚠️观望'}\n")
+    # 方案3：极端风险安全阀（仅系统性暴跌才标风险，日常不拦因子选股）
+    # 极端风险 = 跌停家数 >= 200（全线跌停潮，系统性风险信号最可靠）
+    extreme_risk = (m.get('跌停家数', 0) or 0) >= 200
+    if extreme_risk:
+        print(f"🚨 极端风险警示：跌停 {m.get('跌停家数')} 家（全线跌停潮），因子选股结果仅供参考，谨慎追高")
+    else:
+        print(f"参考：涨停 {m.get('涨停家数')} 家 / 跌停 {m.get('跌停家数')} 家，因子选股为主信号")
     
     # 打分选股（加载前5天数据以计算 limit_up_5d）
     need_cols = ['日期','股票代码','收盘','ret_1d','ret_5d',
