@@ -45,13 +45,21 @@ def _gather():
         af = load_data()
     except Exception:
         pass
-    # 门禁健康（analytical）
-    hls = state = ""
+    # 门禁健康
     try:
         dash = json.loads((STATE / "dashboard.json").read_text(encoding="utf-8"))
     except Exception:
         dash = {}
-    return {"evs": evs, "today_runs": today_runs, "pool": pool, "af": af, "dash": dash}
+    import csv as _csv
+    trades = []
+    tp = Path(r"D:\quant_data\live_trades.csv")
+    if tp.exists():
+        try:
+            trades = list(_csv.DictReader(open(tp, encoding="utf-8")))
+        except Exception:
+            trades = []
+    return {"evs": evs, "today_runs": today_runs, "pool": pool, "af": af, "dash": dash,
+            "trades": trades}  # 改造2.0补：实盘成交（L4 视图）
 
 def build_dashboard_html():
     data = _gather()
@@ -74,10 +82,48 @@ def build_dashboard_html():
                           "dur": r.get("duration_sec"), "enabled": r.get("enabled"),
                           "pool": r.get("pool")} for r in data["today_runs"]],
         "reject": _gate_dist(),
+        # 改造2.0补：实盘验证视图（从 live_trades 归因聚合每因子成交样本/实盘均值/偏差）
+        "live_validation": _live_validation(data["trades"], data["af"]),
     }
     html = _template(payload)
     (STATE / "dashboard.html").write_text(html, encoding="utf-8")
     return str(STATE / "dashboard.html")
+
+
+def _live_validation(trades, af):
+    """实盘验证：按因子归因聚合 live_trades（factor 列 | 分隔），算每因子成交样本/实盘均值/偏差"""
+    if not trades:
+        return {"n_trades": 0, "factors": [], "has_data": False}
+    from collections import defaultdict
+    # 每因子样本
+    per_factor = defaultdict(list)
+    n_total = 0
+    for t in trades:
+        f_col = (t.get("factor") or "").strip()
+        if not f_col or f_col == "manual":
+            continue  # 手工加仓无归因，跳过
+        try:
+            pnl = float(t.get("pnl_pct", 0)) * 100.0  # 小数→百分比
+        except (TypeError, ValueError):
+            continue
+        for fname in [x.strip() for x in f_col.split("|") if x.strip()]:
+            per_factor[fname].append(pnl)
+            n_total += 1
+    # active_factors 里的预期（l4_expected）
+    expected_map = {}
+    for f in af.get("factors", []):
+        expected_map[f.get("name")] = f.get("l4_expected", 0.0)
+    import statistics as _stat
+    factors = []
+    for fname, pnls in per_factor.items():
+        n = len(pnls)
+        realized = round(sum(pnls) / n, 2) if n else 0.0
+        exp = expected_map.get(fname, 0.0)
+        denom = max(abs(exp), 2.0)
+        dev = round((realized - exp) / denom * 100, 1) if denom else 0.0
+        factors.append({"factor": fname, "n": n, "realized_pct": realized,
+                        "expected_pct": exp, "deviation_pct": dev})
+    return {"n_trades": n_total, "factors": factors, "has_data": True}
 
 def _gate_dist():
     """l1_log 的 gate 分布（死因）"""
@@ -93,6 +139,19 @@ def _gate_dist():
     except Exception:
         pass
     return out
+
+def _live_table(lv):
+    """实盘验证表格行（改造2.0补：无数据时给提示行）"""
+    if not lv or not lv.get("has_data"):
+        return "<tr><td colspan=5 style='color:#999'>暂无归因成交数据</td></tr>"
+    rows = ""
+    for x in lv.get("factors", []):
+        dev = x.get("deviation_pct")
+        badge = "✅" if dev is not None and abs(dev) <= 50 else "⚠️"
+        rows += (f"<tr><td>{x['factor']}</td><td>{x['n']}</td>"
+                 f"<td>{x['realized_pct']}</td><td>{x['expected_pct']}</td>"
+                 f"<td>{badge} {x['deviation_pct']}</td></tr>")
+    return rows or "<tr><td colspan=5 style='color:#999'>无</td></tr>"
 
 def _template(p):
     return f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
@@ -135,6 +194,14 @@ table{{border-collapse:collapse;width:100%;font-size:13px}} td,th{{text-align:le
 <table><tr><th>因子</th><th>状态</th><th>权重</th><th>t设计</th></tr>
 {''.join(f"<tr><td>{x['name']}</td><td><span class='badge {x['status']}'>{x['status']}</span></td><td>{x['weight']}</td><td>{x['t_nw_design']}</td></tr>" for x in p['active_factors']) or '<tr><td colspan=4>无激活因子</td></tr>'}
 </table></div>
+
+<div class="card"><h2>🎤 实盘验证（L4·真实成交）</h2>
+<div class="note">成交总数 {p['live_validation']['n_trades']} 笔（归因因子）｜数据源 live_trades.csv</div>
+<table><tr><th>因子</th><th>成交样本</th><th>实盘均值%</th><th>预期%</th><th>偏差%</th></tr>
+{_live_table(p['live_validation'])}
+</table>
+<div class="note">{'暂无实盘成交——有真实买卖（--from-pick 归因）后此处显示每因子 SPRT 进度与偏差。' if not p['live_validation']['has_data'] else '偏差 = (实盘-预期)/max(|预期|,2%)；同因子共享归因样本需打折看待。'}</div>
+</div>
 
 <div class="card"><h2>🕐 Run 时间线（今日）</h2>
 {_timeline(p['run_timeline'])}
