@@ -109,12 +109,26 @@ def run_l3(ck, verbose=True):
     # l3_evaluate 内部 = cumulative_tested + n_peek；这里维护累计基线
     N = ck.get("cumulative_tested", 0) + ck.get("peek_spent", 0)
     enabled_names = [p["name"] for p in pool if p["status"] in ("启用", "实盘确认")]
-    # 已启用因子注入（保持它们在打分中）
+    # 已启用因子注入（改造2.0 2.1：用 active_factors.json 单一真相源，替代从 pool 现场拼；
+    # 含灰度权重系数 0.5×target——新因子不满权重上实盘）
     extra = {}
-    for p in pool:
-        if p["status"] in ("启用", "实盘确认"):
-            w = p.get("weight", 0.05)
-            extra[p["name"]] = (f"({p['expr']}).rank().over('日期')", w)
+    try:
+        from paper.active_factors import load_data
+        af = load_data()
+        for f in af.get("factors", []):
+            st = f.get("status", "")
+            if st in ("启用", "实盘确认", "pin"):
+                extra[f["name"]] = (f"({f['expr']}).rank().over('日期')", f.get("weight", 0.02))
+            elif st == "灰度":
+                # 灰度：0.5×weight_target
+                w = f.get("weight_target", f.get("weight", 0.02))
+                extra[f["name"]] = (f"({f['expr']}).rank().over('日期')", 0.5 * w)
+    except Exception:
+        # 回退：从 pool 拼（active_factors 不可用时保留旧行为）
+        for p in pool:
+            if p["status"] in ("启用", "实盘确认"):
+                w = p.get("weight", 0.05)
+                extra[p["name"]] = (f"({p['expr']}).rank().over('日期')", w)
     n_enabled = 0
     for cand in candidates:
         peek = cand.get("n_peek", 1)
@@ -142,6 +156,20 @@ def run_l3(ck, verbose=True):
                 t_ret = train_m_per_cand(report.get("train"))
                 cand["l4_expected"] = t_ret
             n_enabled += 1
+            # 改造2.0 2.1灰度规则：新启用因子以 0.5×target + 灰度 进 active_factors
+            try:
+                from paper.active_factors import set_factor
+                wt = cand.get("weight", 0.04) or 0.04
+                set_factor(cand["name"],
+                           expr=cand["expr"], weight=0.5 * wt, weight_target=wt,
+                           status="灰度", origin=f"loop_b{ck.get('batch_id')}",
+                           since=time.strftime("%Y-%m-%d"),
+                           t_nw_design=cand.get("t_nw_design"), t_nw_holdout=cand.get("t_nw_holdout"),
+                           icir_tradable=cand.get("icir_tradable"),
+                           half_life=cand.get("half_life"), l4_expected=cand.get("l4_expected"),
+                           ic_series_path=cand.get("ic_series_path"))
+            except Exception as e:
+                print(f"  [active_factors] 写入失败: {e}")
         else:
             cand["status"] = "回滚"
             cand["rollback_reason"] = report.get("reason", "")

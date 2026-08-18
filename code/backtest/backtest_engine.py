@@ -38,8 +38,8 @@ COMM_RATE = 0.00025
 COMM_MIN = 5.0
 STAMP_RATE = 0.0005
 
-# v7 基线六因子权重
-BASE_FACTORS = [
+# v7 基线六因子权重（改造2.0 2.1：启动时读 active_factors.json，此处仅 fallback 常量）
+V7_BASE_FACTORS = [
     ("s1", "(-pl.col('ret_5d') * pl.col('turn_ma5'))", 0.25),   # 低换手+回调
     ("s2", "(-pl.col('ma5_dist') * pl.col('turn_ma5'))", 0.20), # 偏离均线
     ("s3", "(-pl.col('vol_10d') - pl.col('vol_change_5d'))", 0.15), # 低波动+缩量
@@ -47,6 +47,38 @@ BASE_FACTORS = [
     ("s5", "(-pl.col('turn_ratio'))", 0.15),                    # 低换手
     ("s6", "pl.col('macd_dif')", 0.10),                         # MACD
 ]
+# 基线开关（--baseline-only 复现 v7 历史基线；默认读 active_factors.json）
+BASELINE_ONLY = False
+
+def load_base_factors(baseline_only=False):
+    """读取打分因子清单 [(name, expr, weight), ...]
+    改造2.0 2.1：默认读 active_factors.json（单一真相源）；baseline_only 用 v7 固定
+    表达式过沙箱，失败跳过该因子"""
+    if baseline_only:
+        return V7_BASE_FACTORS
+    try:
+        from paper.active_factors import load_data
+        from loop.expr_sandbox import safe_compile
+        data = load_data()
+        out = []
+        for f in data.get("factors", []):
+            if f.get("status") in ("启用", "灰度", "pin", "实盘确认"):
+                ex, err = safe_compile(f.get("expr", ""))
+                if ex is None:
+                    if BASELINE_ONLY is False:
+                        pass  # 静默跳过问题因子（有 prints 的 fallback 分支）
+                    continue
+                out.append((f["name"], f["expr"], f.get("weight", 0.02)))
+        if out:
+            return out
+    except Exception:
+        pass
+    return V7_BASE_FACTORS
+
+# 基线因子（改造2.0 2.1）：L3 判定比对用固定 v7 基线（不随 active 漂移）；
+# 实际打分注入在 run_backtest 的 extra_factors（由 l3 传 active 启用因子清单）
+BASE_FACTORS = V7_BASE_FACTORS
+load_base_factors = lambda baseline_only=False: V7_BASE_FACTORS
 
 def slippage(ret_1d):
     vol_factor = min(abs(ret_1d) / 0.05, 1.0) if ret_1d is not None else 0.5

@@ -161,6 +161,7 @@ def sprt_decision(returns, mu1, sigma=None, alpha=0.05, beta=0.05):
 def l4_evaluate(factor, paper_trades, sigma_prior=None, verbose=True):
     """因子实盘验证。paper_trades: [{pnl_pct, date}]。
     改造 2.3：pnl_pct 从 csv 读来是字符串 → float() 清洗，丢弃不可解析行记 bad_rows
+    改造 2.2：多因子归因——factor 列用 | 分隔，name in split('|') 命中即可；共享样本记 shared_attr
     改造 3.1：min_n 样本分级真正生效（原来只 if n<5，短寿命 5 笔未生效）
     返回 (状态, 报告)
     """
@@ -168,9 +169,15 @@ def l4_evaluate(factor, paper_trades, sigma_prior=None, verbose=True):
     # 2.3: float 清洗（csv 字符串 → 数值；丢弃坏行）
     bad_rows = 0
     rets = []
+    shared_attr = 0
     for t in paper_trades:
-        if t.get("factor") != name:
+        # 2.2: 多因子归因匹配（factor 列可能 "s1|s6"）
+        f_col = t.get("factor") or ""
+        names = [x.strip() for x in str(f_col).split("|") if x.strip()]
+        if name not in names:
             continue
+        if len(names) > 1:
+            shared_attr += 1  # 共享归因（SPRT 单因子序贯，不要求互斥，但事后要打折）
         try:
             rets.append(float(t.get("pnl_pct", 0)))
         except (TypeError, ValueError):
@@ -203,7 +210,8 @@ def l4_evaluate(factor, paper_trades, sigma_prior=None, verbose=True):
     dev = (realized - exp_pct) / denom * 100
     report = {"n": n, "realized_pct": round(realized, 3), "expected_pct": exp_pct,
               "deviation_pct": round(dev, 1), "lnLR": round(lnLR, 3),
-              "sprt": decision, "short_lived": short_lived}
+              "sprt": decision, "short_lived": short_lived,
+              "shared_attr": shared_attr}  # 改造2.2：共享归因样本数（事后打折依据）
     # regime 感知：deviation 超 ±50% 且 SPRT 倾向回滚 → 回滚；否则观察
     if decision == "启用" and abs(dev) <= 50:
         status = "实盘确认"
