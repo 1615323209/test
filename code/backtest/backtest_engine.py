@@ -52,13 +52,14 @@ def slippage(ret_1d):
     vol_factor = min(abs(ret_1d) / 0.05, 1.0) if ret_1d is not None else 0.5
     return 0.001 + 0.002 * vol_factor
 
-def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=True):
+def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=True, return_by_year=False):
     """
     extra_factors: dict {name: (polars_expr_str, weight)}
         polars_expr_str 需是 Expr 代码字符串，如 "(pl.col('ret_5d')*pl.col('turn_ma5')).rank().over('日期')"
         weight: 在总 score 中的权重（与 v7 六因子同量纲，rank 0-1 后加权）
     返回 metrics dict:
         {total_ret_pct, annual_pct, trades, win_rate, pl_ratio, max_dd_pct, fee_total}
+    改造 C22：return_by_year=True 时额外返回 year_ret: {年份: 该年卖出平仓的总收益pct}（供 L3 分段披露拆分，免多跑独立分段回测）
     """
     market = pl.read_parquet(MARKET)
     market_dict = {r['日期']: r for r in market.to_dicts()}
@@ -227,10 +228,16 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
     dd = (cum-peak).min(); dd_pct = dd/INIT_CAPITAL*100
     years = (dates[-1]-dates[0]).days/365
     annual = ((INIT_CAPITAL+total_pnl)/INIT_CAPITAL)**(1/years)-1 if years > 0 else 0
-    return {"total_ret_pct": round(ret, 2), "annual_pct": round(annual*100, 2),
+    out = {"total_ret_pct": round(ret, 2), "annual_pct": round(annual*100, 2),
             "n_trades": len(trades), "win_rate": round(win_rate, 1),
             "pl_ratio": round(pl_ratio, 2) if pl_ratio != float('inf') else 99,
             "max_dd_pct": round(dd_pct, 2), "fee_total": round(total_fee, 0)}
+    if return_by_year:
+        # 改造 C22：按卖出年份聚合收益（供分段披露），不再另跑独立分段回测
+        ts["年份"] = pd.to_datetime(ts["sell_date"]).dt.year
+        year_ret = round(ts.groupby("年份")["pnl"].sum() / INIT_CAPITAL * 100, 2).to_dict()
+        out["year_ret"] = {int(k): v for k, v in year_ret.items()}
+    return out
 
 if __name__ == "__main__":
     # 基线回测（v7 原版，无注入）

@@ -116,15 +116,19 @@ def g2_main(expr, df=None, declared_direction=None):
     except Exception:
         pass  # 可交易域数据缺失时不拦（当前 ST 标记缺失）
     main["t_nw"] = round(t, 2)
+    main["_res_cache"] = res  # 改造 C24：G2 预算的多周期结果缓存，G3 复用免重复全量 IC
     return True, "", main
 
 # ============ G3 完整（min，复用 l1_ic_metrics 全量检查） ============
 def g3_full(expr, df=None, main=None):
-    """次周期同号/衰减/分年符号/分段稳定/quintile 单调/Rank vs Normal"""
+    """次周期同号/衰减/分年符号/分段稳定/quintile 单调/Rank vs Normal
+    改造 C24：复用 G2 预算的主周期结果（main._res_cache），G3 不再重复全量 IC"""
     from loop.factor_loop_l1l2 import l1_ic_metrics
-    ok, main2, why = l1_ic_metrics(expr, df=df)
+    res_cache = (main or {}).get("_res_cache")
+    ok, main2, why = l1_ic_metrics(expr, df=df, res=res_cache)
     if not ok:
         return False, why, main2
+    main2.pop("_res_cache", None)  # 缓存不落盘
     return True, "", main2
 
 # ============ G4 内层留出确认（2024，仅一次，不回喂生成器） ============
@@ -204,8 +208,8 @@ def l1_gate_pipeline(cand, verbose=True):
     if not _gate("g2", ok, why):
         _reject(expr_str, why)
         return False, "g2", why, cand
-    # G3 完整
-    ok, why, main = g3_full(expr)
+    # G3 完整（改造 C24：传 G2 的 main 复用主周期缓存，免重复全量 IC）
+    ok, why, main = g3_full(expr, main=main)
     if not _gate("g3", ok, why):
         _reject(expr_str, why)
         return False, "g3", why, cand

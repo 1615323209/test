@@ -90,8 +90,8 @@ def l3_evaluate(cand, cumulative_tested, extra_factors=None, verbose=True):
     injected = {name: (f"({expr}).rank().over('日期')", 0.05)}
     if extra_factors:
         injected.update(extra_factors)
-    # 训练集回测
-    train_m = run_backtest(extra_factors=injected, start_year=2021, end_year=2024, verbose=False)
+    # 训练集回测（改造 C22：return_by_year 一次得全段，分段披露从分年结果拆，省 2 次独立回测）
+    train_m = run_backtest(extra_factors=injected, start_year=2021, end_year=2024, verbose=False, return_by_year=True)
     # 验证集回测
     valid_m = run_backtest(extra_factors=injected, start_year=2025, end_year=2026, verbose=False)
     # N = Σn_peek（L3 文档缺陷 2：旧口径按候选个数累加，低估修正轮窥视次数）
@@ -99,9 +99,10 @@ def l3_evaluate(cand, cumulative_tested, extra_factors=None, verbose=True):
     thr = dynamic_threshold(N)
     train_gain = train_m["total_ret_pct"] - BASELINE["train"]["total_ret_pct"]
     valid_gain = valid_m["total_ret_pct"] - BASELINE["valid"]["total_ret_pct"]
-    # 分段披露（L3 文档缺陷 4）：2021-2023 设计段 / 2024 内层留出（已被 L1 消费）
-    seg_design = run_backtest(extra_factors=injected, start_year=2021, end_year=2023, verbose=False)
-    seg_2024 = run_backtest(extra_factors=injected, start_year=2024, end_year=2024, verbose=False)
+    # 分段披露（L1 已用 2024 做 G4，非独立 OOS）：从 train_m.year_ret 拆 2021-2023 / 2024
+    yr = train_m.get("year_ret", {})
+    seg_design = round(sum(v for y, v in yr.items() if y <= 2023), 2)
+    seg_2024 = round(yr.get(2024, 0.0), 2)
     report = {
         "name": name, "N": N, "N_effective": N, "threshold": round(thr, 3),
         "train": train_m, "valid": valid_m,

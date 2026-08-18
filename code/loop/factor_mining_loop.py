@@ -61,7 +61,8 @@ def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None):
                    "n_peek": cand.get("n_peek"), "role": cand.get("role", "score"),
                    "gate": cand.get("gate_hit", "?"), "status": "L1通过",
                    "ms_g0": gms.get("g0"), "ms_g1": gms.get("g1"),
-                   "ms_g2": gms.get("g2"), "ms_g3": gms.get("g3"), "ms_g4": gms.get("g4")})
+                   "ms_g2": gms.get("g2"), "ms_g3": gms.get("g3"), "ms_g4": gms.get("g4"),
+                   "g1_fail_open": 1 if cand.get("g1_fail_open") else 0})
         ok, why, cand2 = l2_pipeline(cand, pool_exprs, api_key)
         if not ok:
             append_csv(STATE_DIR / "l2_log.csv", {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -187,8 +188,8 @@ def run_l4(ck, paper_file=None, verbose=True):
     return len([p for p in pool if p["status"] == "实盘确认"])
 
 def gate_audit(verbose=True):
-    """工程保障门禁有效性自检（工程保障.md 第六章）：
-    统计 L1/L2 通过率，出现"恒 100% 从未拒绝"即告警（假门禁比没有门禁更危险）"""
+    """工程保障门禁有效性自检（工程保障.md 第六章，改造 C23 三类告警齐备）：
+    1. 恒 100% 通过（假门禁） 2. 关键指标恒空 3. 兜底触发率>10%（G1 fail_open）"""
     import csv as _csv
     alerts = []
     for name, fname, ok_status in [("L1", "l1_log.csv", "L1通过"), ("L2", "l2_log.csv", "入池")]:
@@ -199,13 +200,25 @@ def gate_audit(verbose=True):
             rows = list(_csv.DictReader(open(p, encoding="utf-8")))
         except Exception:
             continue
-        if len(rows) >= 20:
-            ok_n = sum(1 for r in rows if r.get("status") == ok_status)
-            rate = ok_n / len(rows)
-            if rate == 1.0:
-                alerts.append(f"{name} 通过率恒 100%（{len(rows)}次从未拒绝）→ 假门禁风险")
-            elif verbose:
-                print(f"[audit] {name} 通过率 {rate:.0%} ({ok_n}/{len(rows)})")
+        if len(rows) < 20:
+            continue
+        ok_n = sum(1 for r in rows if r.get("status") == ok_status)
+        rate = ok_n / len(rows)
+        # 属性1：恒 100% 通过
+        if rate == 1.0:
+            alerts.append(f"{name} 通过率恒 100%（{len(rows)}次从未拒绝）→ 假门禁风险")
+        elif verbose:
+            print(f"[audit] {name} 通过率 {rate:.0%} ({ok_n}/{len(rows)})")
+        # 属性2：关键指标恒空（L1 的 t_nw_design 全空 → 门禁未真正计算）
+        if name == "L1":
+            tnw = [r for r in rows if r.get("t_nw_design") not in (None, "")]
+            if not tnw and len(rows) >= 20:
+                alerts.append("L1 t_nw_design 恒空 → 主周期门从未真正计算")
+        # 属性3：兜底触发率（L1 的 g1_fail_open）
+        if name == "L1":
+            fo = sum(1 for r in rows if str(r.get("g1_fail_open", "0")) in ("1", "1.0"))
+            if rows and fo / len(rows) > 0.1:
+                alerts.append(f"L1 G1 fail_open 触发率 {fo/len(rows):.0%}>10% → 抽样兜底过高")
     if alerts:
         print("[audit] ⚠️ " + " | ".join(alerts))
     return alerts

@@ -196,7 +196,7 @@ def eval_ic(expr_str):
     except Exception:
         return None
 
-# ---------- 6. 主流程 ----------
+# ---------- 6. 主流程（改造 C21：直接调 l1_refine，单一 prompt 来源，删旧自由发明 prompt + eval_ic） ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=5, help="每轮生成因子数")
@@ -204,68 +204,27 @@ def main():
     ap.add_argument("--smoke", action="store_true", help="快速验证: 1 因子 1 轮")
     args = ap.parse_args()
 
+    import sys as _sys
+    from loop.factor_loop_l1l2 import l1_refine
     api_key = load_deepseek_key()
     ddict = build_dict()
 
-    system = """你是 A 股量化因子研究员，精通 Polars 表达式。你的任务是发明有金融逻辑的因子。
-规则：
-1. 只能基于给定列组合出表达式（列名必须来自数据字典）
-2. 预测目标 fwd_5d（未来5日收益），因子应是横截面排序信号（数值越大越看多/看空都行，我们会取绝对值）
-3. 表达式必须是合法的 polars Expr 代码，例如：pl.col('ret_5d') * pl.col('turn_ma5') 或 pl.col('vol_ratio').rolling_mean(5, min_samples=3) 或 pl.col('close_momentum')——但列名只能用数据字典里的
-4. 支持的操作符和函数：+ - * /、pl.col、.rolling_mean/.rolling_std/.rolling_max/.rolling_min（min_samples 必须给）、.rank().over('日期')、.shift(1).over('股票代码')、pl.corr 等
-5. 不要用未定义的列，不要用 python 内置函数，不要 import
-6. 每个因子必须有金融逻辑（反转/动量/量价背离/主力行为/事件惯性等），且与常见的 ma/vol/turn 因子不同
-7. 输出严格 JSON 数组（不要多余文字），每项：{"name": "英文名", "logic": "金融逻辑", "expr": "polars表达式"}
-
-数据字典："""
-
-    user = f"请生成 1 个预测 {HORIZON} 的因子。\n\n数据字典（可用列）:\n{ddict}"
-
     results = []
     for gen in range(args.n):
-        name, logic, expr_str = None, None, None
-        for rnd in range(1, args.rounds + 1):
-            if rnd == 1:
-                u = user
-            else:
-                u = (f"上一轮你的因子 {name} 检验结果：\n"
-                     f"IC均值={res.get('ic_mean')}, ICIR={res.get('icir')}, "
-                     f"IC>0占比={res.get('ic_pos_pct')}%, 同号段比例={res.get('seg_ok_ratio')}, "
-                     f"最近2段同号={res.get('last2_ok')}\n"
-                     f"（{logic}）\n"
-                     f"请分析这个因子为什么表现如此，修改公式以优化 |ICIR|，输出新的 JSON 数组（仍含 1 个因子）")
-            try:
-                out = llm_chat(system, u, api_key)
-                factors = parse_factors(out)
-                if not factors:
-                    print(f"  [gen{gen} rnd{rnd}] LLM 输出无法解析，跳过")
-                    break
-                f = factors[0]
-                name, logic, expr_str = f.get("name"), f.get("logic"), f.get("expr")
-                res = eval_ic(expr_str)
-                if res is None:
-                    print(f"  [gen{gen} rnd{rnd}] 表达式执行失败: {expr_str}")
-                    if rnd == args.rounds:
-                        break
-                    continue
-                print(f"  [gen{gen} rnd{rnd}] {name}: IC={res['ic_mean']:+.4f} ICIR={res['icir']:+.3f} "
-                      f"同号段={res['seg_ok_ratio']:.0%} last2={res['last2_ok']} <- {logic}")
-                if rnd == args.rounds:
-                    break
-            except Exception as e:
-                print(f"  [gen{gen} rnd{rnd}] API 错误: {e}")
-                time.sleep(2)
-        if name and res:
-            results.append({"name": name, "logic": logic, "expr": expr_str, **res})
+        cand = l1_refine(0, gen, api_key, ddict, max_rounds=args.rounds, smoke=args.smoke)
+        if cand is None:
+            print(f"  [gen{gen}] L1 漏斗未通过（无产出）")
+            continue
+        results.append(cand)
+        print(f"  [gen{gen}] ✅ {cand['name']}: 通过G0-G4 (t_nw={cand.get('t_nw_design')})")
 
-    df = pd.DataFrame(results)
-    if len(df):
+    if results:
+        out = pd.DataFrame(results)
         out_csv = OUT_DIR / "llm_factors.csv"
-        df.to_csv(out_csv, index=False)
-        print(f"\n=== 完成: {len(df)} 个因子 -> {out_csv} ===")
-        print(df[["name", "ic_mean", "icir", "seg_ok_ratio", "last2_ok"]].to_string(index=False))
+        out.to_csv(out_csv, index=False)
+        print(f"\n=== 完成: {len(out)} 个因子通过漏斗 -> {out_csv} ===")
     else:
-        print("\n无有效因子产出")
+        print("\n无因子通过 G0-G4 漏斗")
 
 if __name__ == "__main__":
     main()

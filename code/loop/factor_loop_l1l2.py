@@ -185,15 +185,16 @@ def quintile_mono(expr, df, main_sign):
     except Exception:
         return 0.0
 
-def l1_ic_metrics(expr, df=None):
+def l1_ic_metrics(expr, df=None, res=None):
     """完整 L1 体检（L1 文档第五章：G2 主周期 + G3 完整体检）
     口径：设计段 2021-2023（L1 判定唯一口径，防 L1 反复窥视验证集）
     检查：|t_NW|≥3.0 / 次周期同号 / 衰减<50% / 分年符号一致 /
           半年段一致 / quintile 单调≥0.3 / Rank vs Normal
+    改造 C24：可选 res（G2 预算好的多周期 IC 结果），g3_full 传入避免主周期重复计算
     返回 (通过与否, 指标dict, 拒绝原因)
     """
     df = df if df is not None else load_design_df()
-    res = calc_multi_ic(expr, df=df)
+    res = res if res is not None else calc_multi_ic(expr, df=df)
     if res is None or res[MAIN_HORIZON] is None:
         return False, {}, "表达式执行失败"
     main = res[MAIN_HORIZON]
