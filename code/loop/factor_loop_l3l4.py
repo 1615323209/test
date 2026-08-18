@@ -80,8 +80,31 @@ def dynamic_threshold(N):
     return 0.5 + 0.05 * math.log(max(N, 1))
 
 # ============ L3: 单因子回测判定 ============
-def l3_evaluate(cand, cumulative_tested, extra_factors=None, verbose=True):
+# 改造2.0 3.4：L3 回测结果缓存（同一批候选共享已启用因子注入集，命中直接复用 metrics）
+# 键 = hash(候选注入 + 年份区间)；模块级 dict 在单 run 内共享，命中率高
+_bt_cache = {}
+
+def _bt_key(injected, start_year, end_year):
+    import hashlib as _hl
+    # 注入集序列化（+ 各权重）作为键
+    parts = sorted(f"{n}:{e}:{w:.5f}" for n, (e, w) in injected.items())
+    return _hl.sha1(f"{parts}|{start_year}|{end_year}|1.0".encode()).hexdigest()[:24]
+
+def _cached_backtest(injected, start_year, end_year, return_by_year=False):
+    """改造2.0 3.4：带缓存的全量回测"""
+    key = _bt_key(injected, start_year, end_year)
+    rkey = f"{key}|{return_by_year}"
+    if rkey in _bt_cache:
+        return _bt_cache[rkey]
+    m = run_backtest(extra_factors=injected, start_year=start_year, end_year=end_year,
+                     verbose=False, return_by_year=return_by_year)
+    # 只缓存总指标（year_ret 也在 m 里，随 return_by_year 区分）
+    _bt_cache[rkey] = m
+    return m
+
+def l3_evaluate(cand, cumulative_tested, extra_factors=None, verbose=True, use_bt_cache=True):
     """候选因子过 L3：训练集+验证集回测，动态阈值判定。
+    改造2.0 3.4：use_bt_cache 用磁盘/mem 缓存回测结果（同批共享注入集命中率高）
     返回 (状态, 报告dict)。状态: 启用/回滚/观察
     """
     name = cand["name"]
@@ -90,10 +113,13 @@ def l3_evaluate(cand, cumulative_tested, extra_factors=None, verbose=True):
     injected = {name: (f"({expr}).rank().over('日期')", 0.05)}
     if extra_factors:
         injected.update(extra_factors)
+    _bt = _cached_backtest if use_bt_cache else \
+        (lambda inj, sy, ey, return_by_year=False: run_backtest(extra_factors=inj, start_year=sy,
+                                                                end_year=ey, verbose=False, return_by_year=return_by_year))
     # 训练集回测（改造 C22：return_by_year 一次得全段，分段披露从分年结果拆，省 2 次独立回测）
-    train_m = run_backtest(extra_factors=injected, start_year=2021, end_year=2024, verbose=False, return_by_year=True)
+    train_m = _bt(injected, 2021, 2024, return_by_year=True)
     # 验证集回测
-    valid_m = run_backtest(extra_factors=injected, start_year=2025, end_year=2026, verbose=False)
+    valid_m = _bt(injected, 2025, 2026, return_by_year=False)
     # N = Σn_peek（L3 文档缺陷 2：旧口径按候选个数累加，低估修正轮窥视次数）
     N = cumulative_tested + cand.get("n_peek", 1)
     thr = dynamic_threshold(N)

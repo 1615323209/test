@@ -295,14 +295,19 @@ ANOMALY_PRIORS = [
     "换手率族: turn_ratio / turn_ma5 高 → 未来收益低（过度交易）",
 ]
 
-def make_prompt(batch_id, factor_idx, seed, ddict, pool_topics=None):
-    """生成 prompt：C1 复现 anomaly + 反冗余主题配额（L1 文档 8.3-C1 / 第七章）"""
+def make_prompt(batch_id, factor_idx, seed, ddict, pool_topics=None, n_batch=1):
+    """生成 prompt：C1 复现 anomaly + 反冗余主题配额（L1 文档 8.3-C1 / 第七章）
+    改造2.0 3.2：n_batch>1 时要求一次输出多个候选（批量生成，G0/G1 预筛后进 G2+）"""
     topics = ""
     if pool_topics:
         topics = f"\n已入池/候选因子主题（避免重复挖掘同一主题，请从欠代表主题出题）:\n{pool_topics}\n"
-    return (f"请生成 1 个预测 {MAIN_HORIZON} 的因子。优先复现以下已发表 anomaly 并针对 A 股制度（T+1/涨跌停/散户占比高/板块炒作）做适配改造：\n"
+    plural = f"请生成 {n_batch} 个不同的预测 {MAIN_HORIZON} 的因子" if n_batch > 1 \
+        else f"请生成 1 个预测 {MAIN_HORIZON} 的因子"
+    return (f"{plural}。优先复现以下已发表 anomaly 并针对 A 股制度（T+1/涨跌停/散户占比高/板块炒作）做适配改造：\n"
             + "\n".join(f"- {a}" for a in ANOMALY_PRIORS)
             + topics
+            + (f"（一次返回 {n_batch} 个因子，每个方向尽量不同，如一个方向失败其余可补位）"
+               if n_batch > 1 else "")
             + f"（确定性采样 seed={seed}，请基于金融逻辑，不要受 seed 影响）\n\n"
             f"数据字典（可用列）:\n{ddict}")
 
@@ -353,21 +358,31 @@ def l2_dedup(expr, pool_exprs, df=None):
     for p in pool_exprs:
         if p.get("expr_hash") == h:
             return False, "语义重复"
-    # 数值去重：逐日横截面 Pearson/Spearman 相关，取时间均值（L2 文档缺陷 7 修复）
-    # + 归一化互信息 MI（L2 文档缺陷 6：一般非线性冗余通道）
+    # 数值去重（改造2.0 3.3：向量缓存——候选+池内因子向量都从 vec_cache 拿，纯内存逐日相关，
+    # 不再每次 full merge + group_by parquet；成本与池大小解耦）
     try:
-        cand = df.with_columns(expr.alias("_c"))
+        from paper.vec_cache import get_vec
+        from loop.factor_loop_l1l2 import load_design_df as _ldd
+        df_full = df if df is not None else _ldd()
+        dates = df_full["日期"].to_list()
+        cand_vec = get_vec(expr, df=df_full)
+        import pandas as _pd
+        cand_frame = _pd.DataFrame({"日期": dates, "_c": cand_vec})
         for p in pool_exprs:
             try:
                 pe, perr, _ = safe_compile(p["expr"])
                 if pe is None:
                     continue
-                merged = cand.with_columns(pe.alias("_p"))
-                daily = (merged.select(["日期", "_c", "_p"])
-                         .group_by("日期")
-                         .agg([pl.corr(pl.col("_c"), pl.col("_p")).alias("pear"),
-                               pl.corr(pl.col("_c"), pl.col("_p"), method="spearman").alias("spe")])
-                         .filter(pl.col("pear").is_not_null() & pl.col("pear").is_finite()))
+                p_vec = get_vec(p["expr"], df=df_full)  # 池内因子向量（入池时算过，秒回）
+                if len(p_vec) != len(cand_vec):
+                    continue
+                merged = cand_frame.copy()
+                merged["_p"] = p_vec
+                daily = (merged.dropna().groupby("日期")
+                         .apply(lambda g: _pd.Series({
+                             "pear": g["_c"].corr(g["_p"]),
+                             "spe": g["_c"].corr(g["_p"], method="spearman")}, dtype=float))
+                         .dropna())
                 if len(daily) < 30:
                     continue
                 m_pear = float(daily["pear"].mean())
@@ -377,8 +392,7 @@ def l2_dedup(expr, pool_exprs, df=None):
                 # MI 通道：抽样 5 万行分箱离散化算归一化互信息（<0.3 通过）
                 try:
                     from sklearn.metrics import normalized_mutual_info_score
-                    import pandas as _pd
-                    smp = merged.select(["_c", "_p"]).drop_nulls().sample(n=50_000, seed=7)
+                    smp = merged.dropna().sample(n=min(50_000, len(merged)), random_state=7)
                     c_ser = _pd.Series(smp["_c"].to_numpy())
                     p_ser = _pd.Series(smp["_p"].to_numpy())
                     c_bin = _pd.qcut(c_ser, 20, labels=False, duplicates="drop")
@@ -405,16 +419,15 @@ def l2_orthogonal(expr, base_exprs, df=None):
     """
     df = df if df is not None else load_design_df()
     try:
-        # 先物化再 rank（polars 不支持带 over 的表达式直接 .rank().over() 嵌套，会全 NaN）
-        y = (df.with_columns(expr.alias("_y0"))
-             .with_columns(pl.col("_y0").rank().over("日期").alias("_y"))["_y"].to_numpy())
+        # 改造2.0 3.3：y 与基准 X 都从 vec_cache 拿（纯内存 numpy，不再每晚物化 rank parquet）
+        from paper.vec_cache import get_vec
+        y = get_vec(expr, df=df)
         X_cols = []
         for b in base_exprs:
             be, berr, _ = safe_compile(b)
             if be is None:
                 continue
-            X_cols.append((df.with_columns(be.alias("_x0"))
-                           .with_columns(pl.col("_x0").rank().over("日期").alias("_x"))["_x"].to_numpy()))
+            X_cols.append(get_vec(b, df=df))
         if not X_cols:
             return False, 0.0, 0.0
         X = np.column_stack(X_cols)
@@ -540,12 +553,15 @@ def l2_half_life(expr, df=None):
         return None
 
 # ============ L1 主流程（LLM 生成 + G0-G4 漏斗修正） ============
-def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False, pool_topics=None):
-    """生成一个因子并过 L1（G0-G4 漏斗）修正。返回 dict 或 None
+def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False, pool_topics=None, n_batch=1):
+    """生成因子并过 L1（G0-G4 漏斗）修正。返回 dict 或 None
     2026-08-17 接入 factor_loop_gates.l1_gate_pipeline（替代旧 l1_ic_metrics 单一体检），
     顺带修复：缺陷 11（提前放弃 20%）、缺陷 12（best_fail_reason 初始化）
-    2026-08-17 C1 升级：复现 anomaly + 契约字段（declared_direction/hypothesis）"""
+    2026-08-17 C1 升级：复现 anomaly + 契约字段（declared_direction/hypothesis）
+    2026-08-18 改造2.0 3.2：n_batch>1 批量生成（先 G0/G1 预筛，最有希望者进 G2+）
+    """
     from loop.factor_loop_gates import l1_gate_pipeline
+    args_n_batch = n_batch
     seed = batch_id * 1000 + factor_idx
     best_fail_reason = ""  # 缺陷 12 修复：首轮异常时不再 NameError
     best_t_nw = None       # 缺陷 11：提前放弃基线（首轮通过 G2 的 |t_NW|）
@@ -560,7 +576,7 @@ def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False, p
 7. 输出严格 JSON 数组（不要多余文字），每项：{"name": "英文名", "logic": "金融逻辑", "expr": "polars表达式", "narrative": "一句话叙事", "declared_direction": 1或-1, "hypothesis": "可验证假设"}
 
 数据字典："""
-    user = make_prompt(batch_id, factor_idx, seed, ddict, pool_topics=pool_topics)
+    user = make_prompt(batch_id, factor_idx, seed, ddict, pool_topics=pool_topics, n_batch=args_n_batch)
     best = None
     for rnd in range(1, max_rounds + 1):
         if rnd > 1 and best:
@@ -577,6 +593,46 @@ def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False, p
                 best_fail_reason = "JSON 解析失败，请严格输出 JSON 数组"
                 continue
             f = factors[0]
+            # 改造2.0 3.2：批量生成预筛——LLM 返回多个候选时，先全部过 G0/G1（毫秒+秒级），
+            # 只留最有希望的 1-2 个进 G2/G3/G4（其余丢已拒绝库）。单候选时跳过（走原逻辑）
+            if len(factors) > 1:
+                from loop.factor_loop_gates import l1_gate_pipeline as _gp, load_rejected as _lr
+                from loop.factor_loop_l1l2 import expr_hash as _eh
+                cands_pool = []
+                for fi in factors:
+                    fi_name, fi_expr = fi.get("name"), fi.get("expr")
+                    if not fi_expr:
+                        continue
+                    fi_dir = fi.get("declared_direction")
+                    if fi_dir not in (1, -1, 1.0, -1.0):
+                        fi_dir = None
+                    rok, rgate, rwhy, rcand = _gp(
+                        {"name": fi_name, "expr": fi_expr, "logic": fi.get("logic", ""),
+                         "narrative": fi.get("narrative", fi.get("logic", "")),
+                         "declared_direction": fi_dir, "hypothesis": fi.get("hypothesis", fi.get("logic", ""))},
+                        verbose=False)
+                    if rok:
+                        cands_pool.append((fi, rcand))
+                    else:
+                        # G0/G1 拒绝的丢已拒绝库
+                        try:
+                            from loop.factor_loop_gates import _reject
+                            _reject(fi_expr, f"{rgate}: {rwhy}")
+                        except Exception:
+                            pass
+                if cands_pool:
+                    # 选最有希望者（|t_nw_design| 最大）作为主候选进行后续轮
+                    cands_pool.sort(key=lambda x: abs(x[1].get("t_nw_design", 0) or 0), reverse=True)
+                    f = cands_pool[0][0]  # 主候选
+                    f["_prepassed"] = True
+                    if len(cands_pool) > 1:
+                        f["_backup"] = cands_pool[1][0]  # 备用（修正轮若主候选失败用）
+                else:
+                    # 全被 G0/G1 筛掉：记失败，进下一轮
+                    best_fail_reason = "批量生成候选全部止于 G0/G1"
+                    if rnd == max_rounds:
+                        break
+                    continue
             name, logic, expr_str = f.get("name"), f.get("logic"), f.get("expr")
             narrative = f.get("narrative", logic)
             declared_direction = f.get("declared_direction")

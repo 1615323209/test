@@ -28,7 +28,7 @@ from loop import factor_loop_l1l2 as L1L2
 from loop.factor_loop_l3l4 import l3_evaluate, calc_weights, update_dashboard, BASELINE
 from loop.llm_factor_synth import load_deepseek_key, build_dict
 
-def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None, budget_sec=None):
+def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None, budget_sec=None, n_batch=1):
     """L2 批次：生成 n_cands 个候选 → L1 → L2 → 入池（每候选处理完即保存检查点）
     改造2.0 3.1：budget_sec 预算驱动——每候选检查剩余预算，不足单候选历史 P80 耗时则 stop（exit_reason=budget）"""
     if smoke:
@@ -54,7 +54,7 @@ def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None, bu
             break
         if verbose:
             print(f"  [L1] batch{batch_id} 候选{idx}...")
-        cand = l1_refine(batch_id, idx, api_key, ddict, max_rounds=3, smoke=smoke, pool_topics=pool_topics)
+        cand = l1_refine(batch_id, idx, api_key, ddict, max_rounds=3, smoke=smoke, pool_topics=pool_topics, n_batch=n_batch)
         if cand is None:
             append_csv(STATE_DIR / "l1_log.csv", {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                        "batch": batch_id, "idx": idx, "status": "L1失败"})
