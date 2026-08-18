@@ -26,6 +26,9 @@ TRAIN_LO, TRAIN_HI = date(2021, 1, 1), date(2024, 12, 31)
 DESIGN_LO, DESIGN_HI = date(2021, 1, 1), date(2023, 12, 31)
 HOLDOUT_LO, HOLDOUT_HI = date(2024, 1, 1), date(2024, 12, 31)
 VAL_LO, VAL_HI = date(2025, 1, 1), date(2026, 12, 31)
+# 改造 4.2：DL 单独切段（训练 2021-01~2023-06、选模 2023-07~12，2024 只留给 L1-G4）
+DL_TRAIN_LO, DL_TRAIN_HI = date(2021, 1, 1), date(2023, 6, 30)
+DL_VAL_LO, DL_VAL_HI = date(2023, 7, 1), date(2023, 12, 31)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -78,8 +81,9 @@ def main():
 
     # 3. 按股票滑窗
     print("[3/4] 滑窗构建张量...")
-    # 三段切分（train_alpha360 泄漏修复：设计段训练/2024内层验证/2025-2026真验证）
-    design_x, design_y, design_meta = [], [], []
+    # 四段切分（改造 4.2：DL 单独切段——训练 2021-01~2023-06、选模 2023-07~12、2024 只留给 L1-G4）
+    dl_train_x, dl_train_y, dl_train_meta = [], [], []
+    dl_val_x, dl_val_y, dl_val_meta = [], [], []
     holdout_x, holdout_y, holdout_meta = [], [], []
     valid_x, valid_y, valid_meta = [], [], []
     n_stocks = d['股票代码'].n_unique()
@@ -101,8 +105,10 @@ def main():
             if not np.isfinite(yw[j]):
                 continue
             xx = np.nan_to_num(xw[j], nan=0.0).astype(np.float32)
-            if DESIGN_LO <= dt <= DESIGN_HI:
-                design_x.append(xx); design_y.append(yw[j]); design_meta.append((dt.isoformat(), code))
+            if DL_TRAIN_LO <= dt <= DL_TRAIN_HI:
+                dl_train_x.append(xx); dl_train_y.append(yw[j]); dl_train_meta.append((dt.isoformat(), code))
+            elif DL_VAL_LO <= dt <= DL_VAL_HI:
+                dl_val_x.append(xx); dl_val_y.append(yw[j]); dl_val_meta.append((dt.isoformat(), code))
             elif HOLDOUT_LO <= dt <= HOLDOUT_HI:
                 holdout_x.append(xx); holdout_y.append(yw[j]); holdout_meta.append((dt.isoformat(), code))
             elif VAL_LO <= dt <= VAL_HI:
@@ -122,7 +128,8 @@ def main():
                         "features": feats, "window": WINDOW}, ensure_ascii=False), encoding="utf-8")
         print(f"  {prefix}: x{x.shape} y{y.shape} {len(meta)}样本")
 
-    save("design", design_x, design_y, design_meta)
+    save("dl_train", dl_train_x, dl_train_y, dl_train_meta)
+    save("dl_val", dl_val_x, dl_val_y, dl_val_meta)
     save("holdout", holdout_x, holdout_y, holdout_meta)
     save("valid", valid_x, valid_y, valid_meta)
     print(f"=== 完成 {time.time()-t0:.0f}s ===")

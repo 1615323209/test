@@ -7,7 +7,7 @@
 """
 import json, os, re, sys, time, hashlib
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import numpy as np
 import polars as pl
 import pandas as pd
@@ -43,23 +43,37 @@ def load_train_df():
     _cache["train"] = df
     return df
 
+# L1 文档第二章：embargo——设计段与留出段间留空档，防 fwd_20d 标签跨段污染 G4
+EMBARGO_DAYS = 20  # 取 fwd_* 最长周期（20日）
+
 def load_design_df():
-    """加载设计段(2021-2023)因子+forward收益（L1 判定唯一口径）"""
+    """加载设计段(2021-2023)因子+forward收益（L1 判定唯一口径）
+    改造 3.7：embargo——purge 段末 EMBARGO_DAYS 个交易日（防 fwd_20d 标签落进 2024）"""
     if "design" in _cache:
         return _cache["design"]
     s = pl.scan_parquet(IC_DATA)
     df = s.filter((pl.col("日期") >= DESIGN_LO) & (pl.col("日期") <= DESIGN_HI)).collect()
-    _cache["design"] = df
-    return df
+    # 段末 purge 20 个交易日（其 fwd_20d 标签跨到 2024，会污染 G4 留出）
+    cutoff = df["日期"].max() - timedelta(days=40)  # 覆盖 ~20 交易日（含周末）
+    d_clean = df.filter(pl.col("日期") <= cutoff)
+    n_purged = len(df) - len(d_clean)
+    if n_purged > 0:
+        print(f"[embargo] 设计段 purge {n_purged} 行 (>{cutoff} 共{n_purged}个样本跨越 fwd_20d)")
+    _cache["design"] = d_clean
+    return d_clean
 
 def load_holdout_df():
-    """加载内层留出段(2024)（仅 G4 一次性确认用）"""
+    """加载内层留出段(2024)（仅 G4 一次性确认用）
+    改造 3.7：段首 purge——开头 20 个交易日的 fwd_20d 标签被设计段消费，样本不完整"""
     if "holdout" in _cache:
         return _cache["holdout"]
     s = pl.scan_parquet(IC_DATA)
     df = s.filter((pl.col("日期") >= HOLDOUT_LO) & (pl.col("日期") <= HOLDOUT_HI)).collect()
-    _cache["holdout"] = df
-    return df
+    # 段首 purge 20 个交易日（其 fwd_20d 起始日在 2024 前，标签被设计段 G0-G3 看过）
+    start = df["日期"].min() + timedelta(days=40)
+    d_clean = df.filter(pl.col("日期") >= start)
+    _cache["holdout"] = d_clean
+    return d_clean
 
 def load_full_ic_cols():
     """ic_data 全部列名（列名校验用）"""
@@ -568,10 +582,43 @@ def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False, p
             if declared_direction not in (1, -1, 1.0, -1.0):
                 declared_direction = None  # 未声明 → G2 跳过符号检查
             hypothesis = f.get("hypothesis", logic)
-            # G0-G4 漏斗（含列名校验/沙箱/主周期/完整/留出 + 声明符号检查）
+            # 改造 4.3：role/label_spec 从 LLM 读取 + 白名单校验（不再硬编码 score）
+            role = f.get("role", "score")
+            if role not in ("score", "exit", "timing"):
+                print(f"    [L1 b{batch_id}f{factor_idx} r{rnd}] role非法({role})→降级score")
+                role = "score"
+            label_kind = f.get("label_spec", {}).get("kind") if isinstance(f.get("label_spec"), dict) else None
+            if label_kind not in ("fwd_ret", "triple_barrier", "max_dd"):
+                label_kind = "fwd_ret"
+            label_horizon = f.get("label_spec", {}).get("horizon", 5) if isinstance(f.get("label_spec"), dict) else 5
+            label_spec = {"kind": label_kind, "horizon": label_horizon}
+            # 非 score 角色：跳过 IC 类门（G2/G3/G4 只对 fwd_5d 有意义），直接档案登记路径
+            if role != "score":
+                # 仍过 G0（沙箱/列名校验）但标记 archived_only，由 L2 走登记分支
+                ok, gate, why, cand = l1_gate_pipeline(
+                    {"name": name, "expr": expr_str, "logic": logic, "narrative": narrative,
+                     "declared_direction": declared_direction, "hypothesis": hypothesis,
+                     "role": role, "label_spec": label_spec},
+                    verbose=False)
+                if not ok:
+                    print(f"    [L1 b{batch_id}f{factor_idx} r{rnd}] {name}: [{gate}] {why} (exit/timing 仅过静态门)")
+                    if rnd == max_rounds:
+                        break
+                    best_fail_reason = f"卡在{gate}: {why}"
+                    continue
+                return {"name": name, "logic": logic, "narrative": narrative,
+                        "expr": expr_str, "expr_hash": expr_hash(expr_str),
+                        "ic_metrics": cand.get("l1_metrics", {}),
+                        "declared_direction": declared_direction, "hypothesis": hypothesis,
+                        "label_spec": label_spec, "role": role,
+                        "batch_id": batch_id, "factor_idx": factor_idx,
+                        "seed": seed, "rounds": rnd, "n_peek": rnd,
+                        "version_chain": [{"v": 1, "expr": expr_str}]}
+            # G0-G4 漏斗（score 角色：含列名校验/沙箱/主周期/完整/留出 + 声明符号检查）
             ok, gate, why, cand = l1_gate_pipeline(
                 {"name": name, "expr": expr_str, "logic": logic, "narrative": narrative,
-                 "declared_direction": declared_direction, "hypothesis": hypothesis},
+                 "declared_direction": declared_direction, "hypothesis": hypothesis,
+                 "role": role, "label_spec": label_spec},
                 verbose=False)
             if not ok:
                 print(f"    [L1 b{batch_id}f{factor_idx} r{rnd}] {name}: [{gate}] {why}")
@@ -595,8 +642,7 @@ def l1_refine(batch_id, factor_idx, api_key, ddict, max_rounds=3, smoke=False, p
                     "t_nw_holdout": cand.get("t_nw_holdout"),
                     "icir_tradable": cand.get("icir_tradable"),
                     "declared_direction": declared_direction, "hypothesis": hypothesis,
-                    "label_spec": {"kind": "fwd_ret", "horizon": 5},  # L1 文档第三章契约：默认预测目标
-                    "role": "score",  # 默认选股打分因子（exit/timing 由生成端声明）
+                    "label_spec": label_spec, "role": role,  # 改造 4.3：透传 LLM 读到的值
                     "batch_id": batch_id, "factor_idx": factor_idx,
                     "seed": seed, "rounds": rnd,
                     "n_peek": rnd,  # 每轮窥视设计段 1 次（L1 文档第二章，L3 多重检验 N 输入）

@@ -41,13 +41,24 @@ def main():
     print(f"[3] 已并入扩展5因子: {len(d)} 行")
 
     # 4. fwd_* 从收盘重算（按股票分组 shift）
+    # 改造 3.7：重算前显式排序（不依赖上游行序，增量合并改变顺序不会静默错位）
+    d = d.sort(["股票代码", "日期"])
     d = d.with_columns([
         (pl.col("收盘").shift(-1) / pl.col("收盘") - 1).over("股票代码").alias("fwd_1d"),
         (pl.col("收盘").shift(-5) / pl.col("收盘") - 1).over("股票代码").alias("fwd_5d"),
         (pl.col("收盘").shift(-10) / pl.col("收盘") - 1).over("股票代码").alias("fwd_10d"),
         (pl.col("收盘").shift(-20) / pl.col("收盘") - 1).over("股票代码").alias("fwd_20d"),
     ])
-    print("[4] fwd_* 已重算")
+    # 自检：fwd_5d 应 ≈ ret_5d.shift(-5)（同股票分组下前 5 日累计收益）
+    chk = d.with_columns(pl.col("ret_5d").shift(-5).over("股票代码").alias("ret_5d_lead"))
+    diff = chk.filter(pl.col("fwd_5d").is_not_null() & pl.col("ret_5d_lead").is_not_null())
+    if len(diff) > 1000:
+        max_diff = float((diff["fwd_5d"] - diff["ret_5d_lead"]).abs().max())
+        if max_diff > 1e-6:
+            raise RuntimeError(f"fwd_5d 自检失败: max diff={max_diff:.2e}")
+        print(f"[4] fwd_* 已重算（自检通过, max_diff={max_diff:.1e}）")
+    else:
+        print("[4] fwd_* 已重算（样本不足无法自检）")
 
     # 5. 训练集切片
     d = d.filter((pl.col("日期") >= TRAIN_LO) & (pl.col("日期") <= TRAIN_HI))

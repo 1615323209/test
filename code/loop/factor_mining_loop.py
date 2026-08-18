@@ -48,15 +48,20 @@ def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None):
         if cand is None:
             append_csv(STATE_DIR / "l1_log.csv", {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                        "batch": batch_id, "idx": idx, "status": "L1失败"})
+            # 改造 3.4：三轮修正全失败的候选也消耗窥视次数（llm 调用过，不能白计）
+            ck["peek_spent"] = ck.get("peek_spent", 0) + 3
             if ck_mgr: ck_mgr.save(ck)
             continue
+        gms = cand.get("gate_ms") or {}
         append_csv(STATE_DIR / "l1_log.csv", {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "batch": batch_id, "idx": idx, "name": cand["name"],
                    "icir": cand["ic_metrics"].get("icir"),
                    "t_nw_design": cand.get("t_nw_design"), "t_nw_holdout": cand.get("t_nw_holdout"),
                    "icir_tradable": cand.get("icir_tradable"),
                    "n_peek": cand.get("n_peek"), "role": cand.get("role", "score"),
-                   "gate": "g0-g4", "status": "L1通过"})
+                   "gate": cand.get("gate_hit", "?"), "status": "L1通过",
+                   "ms_g0": gms.get("g0"), "ms_g1": gms.get("g1"),
+                   "ms_g2": gms.get("g2"), "ms_g3": gms.get("g3"), "ms_g4": gms.get("g4")})
         ok, why, cand2 = l2_pipeline(cand, pool_exprs, api_key)
         if not ok:
             append_csv(STATE_DIR / "l2_log.csv", {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -67,17 +72,7 @@ def run_batch(ck, api_key, n_cands=5, smoke=False, verbose=True, ck_mgr=None):
         cand2["added_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         if cand2.get("archived_only"):
             cand2["status"] = "档案"  # role != score：只登记档案，不进打分池、不触发 L3（L2 文档第七章）
-        # IC 序列外置（L1 文档缺陷 14）：不随 checkpoint 膨胀，落盘 ic_series/{hash}.parquet
-        ic_series = (cand2.get("ic_metrics") or {}).pop("_ic_series", None)
-        if ic_series:
-            try:
-                import polars as _pl
-                sdir = Path(r"D:\quant_data\loop_state\ic_series")
-                sdir.mkdir(parents=True, exist_ok=True)
-                _pl.DataFrame({"ic": list(ic_series)}).write_parquet(sdir / f"{cand2['expr_hash']}.parquet")
-                cand2["ic_series_path"] = f"loop_state/ic_series/{cand2['expr_hash']}.parquet"
-            except Exception:
-                pass
+        # IC 序列外置由漏斗负责（factor_loop_gates._save_ic_series，改造 3.2），主控不再空转
         pool.append(cand2)
         pool_exprs.append({"expr": cand2["expr"], "expr_hash": cand2["expr_hash"], "name": cand2["name"]})
         added += 1
@@ -98,7 +93,9 @@ def run_l3(ck, verbose=True):
         if verbose:
             print("  [L3] 无候选因子，跳过")
         return 0
-    N = ck.get("cumulative_tested", 0)
+    # 改造 3.4：N 口径改 Σn_peek（含三轮修正全失败的 peek_spent）
+    # l3_evaluate 内部 = cumulative_tested + n_peek；这里维护累计基线
+    N = ck.get("cumulative_tested", 0) + ck.get("peek_spent", 0)
     enabled_names = [p["name"] for p in pool if p["status"] in ("启用", "实盘确认")]
     # 已启用因子注入（保持它们在打分中）
     extra = {}
@@ -108,8 +105,9 @@ def run_l3(ck, verbose=True):
             extra[p["name"]] = (f"({p['expr']}).rank().over('日期')", w)
     n_enabled = 0
     for cand in candidates:
+        peek = cand.get("n_peek", 1)
         status, report = l3_evaluate(cand, N, extra_factors=extra, verbose=verbose)
-        N += 1
+        N += peek  # 改造 3.4：按 n_peek 累加（原来 N+=1 低估修正轮窥视）
         report["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
         append_csv(STATE_DIR / "backtest_history.csv", {
             "ts": report["ts"], "name": cand["name"], "N": N,
