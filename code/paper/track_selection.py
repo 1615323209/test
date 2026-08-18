@@ -24,6 +24,21 @@ FACTOR_INCR = DATA / "factor_daily_incr.parquet"
 HORIZONS = [1, 3, 5, 10]       # 后续 N 日涨幅
 UP_ALERT = 0.04                # 盯盘: 涨幅超 +4% 提醒
 DOWN_ALERT = -0.03             # 盯盘: 跌幅超 -3% 提醒
+CODE_NAME = Path("D:/quant_data/code_name_map.csv")
+
+
+def _name(code):
+    """代码 → 公司名（无映射则回退代码）"""
+    try:
+        import polars as _pl
+        if CODE_NAME.exists():
+            m = _pl.read_csv(CODE_NAME, schema_overrides={"代码": _pl.Utf8})
+            hit = m.filter(_pl.col("代码") == str(code))
+            if len(hit):
+                return hit["公司"][0]
+    except Exception:
+        pass
+    return str(code)
 
 
 def load_prices():
@@ -189,7 +204,7 @@ def backfill_and_stats():
     if bench_col in out.columns:
         worst = out[out[bench_col].notna()].sort_values(bench_col).head(3)
         for _, r in worst.iterrows():
-            print(f"  {r['code']} | 选入{r['sel_price']} | 后续{bench_col.replace('ret_','')}日{float(r[bench_col])*100:+.1f}% | 归因={r.get('factors','-')}")
+            print(f"  {_name(r['code'])} | 选入{r['sel_price']} | 后续{bench_col.replace('ret_','')}日{float(r[bench_col])*100:+.1f}% | 归因={r.get('factors','-')}")
     print("  注: 单日样本少(短线<7天)时结论仅供参考，积累更多选股样本才有统计意义")
 
     # 盯盘提醒
@@ -202,7 +217,7 @@ def backfill_and_stats():
             tr = float(r["total_ret"])
             flag = "🚨请关注" if tr >= UP_ALERT or tr <= DOWN_ALERT else ""
             if flag:
-                print(f"  {r['code']} | 选入{r['sel_price']} → 现价{float(r['latest_price']):.2f} | {tr:+.1%} {flag}")
+                print(f"  {_name(r['code'])} | 选入{r['sel_price']} → 现价{float(r['latest_price']):.2f} | {tr:+.1%} {flag}")
     # 落盘更新
     LOG2 = PICKS_DIR / "selection_backfill.csv"
     out.to_csv(LOG2, index=False)
@@ -264,7 +279,7 @@ def _write_kb_report(out):
         if pd.notna(r.get("total_ret")) and pd.notna(r.get("sel_price")):
             tr = float(r["total_ret"])
             if tr >= UP_ALERT or tr <= DOWN_ALERT:
-                lines.append(f"- {r['code']} | 选入{r['sel_price']:.2f} → 现价{float(r['latest_price']):.2f} | {tr:+.1%} 🚨")
+                lines.append(f"- {_name(r['code'])} | 选入{r['sel_price']:.2f} → 现价{float(r['latest_price']):.2f} | {tr:+.1%} 🚨")
                 any_alert = True
     if not any_alert:
         lines.append("- 无超阈值标的")

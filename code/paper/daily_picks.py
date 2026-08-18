@@ -28,6 +28,24 @@ def factor_files():
 INIT_CAPITAL = 20000
 POSITION = 2000
 
+_code_name_cache = None
+
+
+def _cname(code):
+    """代码 → 公司名（无映射则回退显示代码）"""
+    global _code_name_cache
+    try:
+        if _code_name_cache is None:
+            _p = DATA / "code_name_map.csv"
+            if _p.exists():
+                _code_name_cache = pl.read_csv(_p, schema_overrides={"代码": pl.Utf8})
+            else:
+                _code_name_cache = pl.DataFrame({"代码": [], "公司": []})
+        hit = _code_name_cache.filter(pl.col("代码") == str(code))
+        return hit["公司"][0] if len(hit) else str(code)
+    except Exception:
+        return str(code)
+
 # ---- v7 打分权重（改造2.0 2.1：改为读 active_factors.json，此处仅回退常量）----
 FALLBACK_W = {'s1': 0.25, 's2': 0.20, 's3': 0.15, 's4': 0.15, 's5': 0.15, 's6': 0.10}
 
@@ -204,7 +222,7 @@ def main():
             '站上MA20': round(r['ma_20'],2), 'price_pos': round(r['price_pos_20'],2),
             'top_factors': top_factors,  # 改造2.0 2.2：归因（供 --from-pick / L4）
         })
-        print(f"  {rows[-1]['排名']}. {code}  收盘{price:.2f}  评分{rows[-1]['评分']}  "
+        print(f"  {rows[-1]['排名']}. {_cname(code)} ({code})  收盘{price:.2f}  评分{rows[-1]['评分']}  "
               f"{'可买'+str(shares)+'股' if shares>=100 else '不足100股'}")
         print(f"     ret_5d={r['ret_5d']:.3f} vol={r['vol_ratio']:.2f} turn={r['turn_ratio']:.2f} "
               f"涨停5d={int(r['limit_up_5d'])} pos={r['price_pos_20']:.2f} 归因={top_factors}")
