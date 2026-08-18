@@ -11,8 +11,9 @@ Prompt → LLM 生成 Polars 因子公式 → 自动算 IC → 反馈修正（�
 依赖: polars, pandas, numpy, requests, pyyaml
 数据: D:\\quant_data\\ic_data.parquet (schema 自动生成数据字典)
 """
-import os, sys, json, re, time, argparse
+import os, sys, json, re, time, argparse, hashlib  # hashlib: 改造 2.4 内容寻址缓存
 from pathlib import Path
+from datetime import date  # date: 改造 2.4 eval_ic 训练集切片
 import polars as pl
 import pandas as pd
 import numpy as np
@@ -113,12 +114,12 @@ def llm_chat(system, user, api_key, temperature=0.7, seed=None):
             except Exception:
                 cache = {}
         cache[ph] = {"prompt_hash": ph, "model": MODEL, "temperature": temperature,
-                     "seed": seed, "response": resp_text[:500],
+                     "seed": seed, "response": resp_text,  # 改造 2.4：全文（截断无法重放）
                      "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
         cache_path.parent.mkdir(exist_ok=True)
         cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[llm_cache] 缓存写入失败: {e}")  # 改造 2.4：裸 except → 可见
     return resp_text
 
 # ---------- 4. 解析 LLM 输出（JSON 数组，容忍 markdown 代码块） ----------

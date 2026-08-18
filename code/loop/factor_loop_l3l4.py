@@ -23,19 +23,36 @@ BASELINE = {
 }
 
 # ============ L3: 权重计算（含总权重约束与迭代剔除） ============
+def _icir(p):
+    """统一取因子 ICIR（改造 2.1：池内因子的 ICIR 在 ic_metrics.icir，顶层没有）。
+    优先可交易域 icir_tradable，否则全域 ic_metrics.icir，再否则 0.0"""
+    t = p.get("icir_tradable")
+    if t is not None:
+        return abs(float(t))
+    m = p.get("ic_metrics") or {}
+    v = m.get("icir")
+    if v is not None:
+        return abs(float(v))
+    return 0.0
+
 def calc_weights(pool):
     """pool: 启用因子列表 [{name, icir, half_life}]。返回 {name: weight}（缩放后）
     L3 文档第四章修正：
     - ICIR 优先用可交易域口径 icir_tradable（缺陷 3，全域 ICIR 含不可买样本假 alpha）
     - half_life_unknown 按 short_lived 保守处理，封顶 0.04（缺陷 L3-4）
+    改造 2.1：用 _icir 统一取数（原来 p["icir"] 顶层 KeyError），tradable 为空记 icir_fallback
     """
     if not pool:
         return {}
-    ics = [abs(p.get("icir_tradable") or p["icir"]) for p in pool]
-    med = float(np.median(ics)) if ics else 0.05
+    ics = [_icir(p) for p in pool]
+    # 可交易域 ICIR 缺失降级到全域（口径降级要可见）
+    for p in pool:
+        if p.get("icir_tradable") is None and "icir_fallback" not in p:
+            p["icir_fallback"] = "full_domain"
+    med = float(np.median(ics)) if any(ics) else 0.05
     weights = {}
     for p in pool:
-        icir = abs(p.get("icir_tradable") or p["icir"])
+        icir = _icir(p)
         w = 0.05 * icir / max(med, 1e-6)
         w = min(w, 0.10)                        # 封顶
         if p.get("short_lived") or p.get("half_life_unknown"):
@@ -142,22 +159,38 @@ def sprt_decision(returns, mu1, sigma=None, alpha=0.05, beta=0.05):
 
 def l4_evaluate(factor, paper_trades, sigma_prior=None, verbose=True):
     """因子实盘验证。paper_trades: [{pnl_pct, date}]。
+    改造 2.3：pnl_pct 从 csv 读来是字符串 → float() 清洗，丢弃不可解析行记 bad_rows
+    改造 3.1：min_n 样本分级真正生效（原来只 if n<5，短寿命 5 笔未生效）
     返回 (状态, 报告)
     """
     name = factor["name"]
-    rets = [t.get("pnl_pct", 0) for t in paper_trades if t.get("factor") == name]
+    # 2.3: float 清洗（csv 字符串 → 数值；丢弃坏行）
+    bad_rows = 0
+    rets = []
+    for t in paper_trades:
+        if t.get("factor") != name:
+            continue
+        try:
+            rets.append(float(t.get("pnl_pct", 0)))
+        except (TypeError, ValueError):
+            bad_rows += 1
     n = len(rets)
-    # 样本分级（L4 文档缺陷 2：half_life_unknown 按短寿命保守处理，10 交易日+5 笔）
+    # 3.1: 样本分级生效（half_life_unknown 按短寿命保守处理，10 交易日+5 笔）
     short_lived = factor.get("short_lived", False) or factor.get("half_life_unknown", False)
     min_n = 5 if short_lived else 10
-    if n < 5:
-        return "观察", {"n": n, "reason": "样本不足(早期预警线未到)"}
+    if n < min_n:
+        return "观察", {"n": n, "min_n": min_n, "reason": f"样本不足({n}<{min_n}笔)", "bad_rows": bad_rows}
     # 预期基准：降级验证因子 → 0
     expected = factor.get("l4_expected", 0.0)
     if factor.get("degraded_enabled"):
         expected = 0.0
-    # SPRT
-    sigma = sigma_prior or np.std(rets) if len(rets) > 1 else 0.02
+    # SPRT（2.3: 明确 sigma 优先级，避免靠 Python 运算符优先级碰巧成立）
+    if sigma_prior is not None and sigma_prior > 0:
+        sigma = sigma_prior
+    elif len(rets) > 1:
+        sigma = max(float(np.std(rets)), 0.01)
+    else:
+        sigma = 0.02
     decision, lnLR = sprt_decision(rets, expected / 100.0, sigma=sigma)
     # 偏差检测（绝对值地板 2%）
     realized = np.mean(rets) if rets else 0
@@ -181,15 +214,19 @@ def l4_evaluate(factor, paper_trades, sigma_prior=None, verbose=True):
 
 # ============ Dashboard ============
 def update_dashboard(pool, history, l4_log, state_dir=STATE_DIR):
-    """刷新 dashboard.json（池健康分）"""
+    """刷新 dashboard.json（池健康分）
+    改造 2.2：half_life=None（L2 半衰期算不出）不再 TypeError，空值项记 None + coverage"""
     n_enabled = sum(1 for p in pool if p["status"] in ("启用", "实盘确认"))
+    # 收集非空 half_life（None = 半衰期算不出，不参与均值，但要统计覆盖率）
+    hls = [h for p in pool if (h := p.get("half_life")) is not None]
+    hlf_cov = round(len(hls) / len(pool), 2) if pool else 0.0
     if not pool:
         score = 100.0
     else:
-        avg_hl = np.mean([p.get("half_life", 12) for p in pool])
+        avg_hl = float(np.mean(hls)) if hls else None
         # 健康分 = 加权：启用数(30%) + 半衰期(30%) + 平均ICIR(20%) + 实盘偏差(20%)
-        s_hl = min(avg_hl / 12, 1.0) * 30
-        s_ic = min(np.mean([abs(p.get("icir", 0)) for p in pool]) / 0.3, 1.0) * 20
+        s_hl = (min(avg_hl / 12, 1.0) * 30) if hls else 0.0  # 半衰期全缺失 → 该项 0 分
+        s_ic = min(float(np.mean([_icir(p) for p in pool])) / 0.3, 1.0) * 20
         s_act = min(n_enabled / 10, 1.0) * 30
         s_live = 20.0
         if l4_log:
@@ -204,7 +241,8 @@ def update_dashboard(pool, history, l4_log, state_dir=STATE_DIR):
         "pool_size": len(pool),
         "enabled": n_enabled,
         "health_score": round(score, 1),
-        "avg_half_life": round(float(np.mean([p.get("half_life", 12) for p in pool])), 1) if pool else 0,
+        "avg_half_life": round(float(avg_hl), 1) if avg_hl is not None else None,
+        "half_life_coverage": hlf_cov,  # 改造 2.2：半衰期覆盖率（缺失项单独暴露）
         "last_backtest": history[-1] if history else None,
         "last_l4": l4_log[-1] if l4_log else None,
     }
