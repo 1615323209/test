@@ -207,6 +207,79 @@ def backfill_and_stats():
     LOG2 = PICKS_DIR / "selection_backfill.csv"
     out.to_csv(LOG2, index=False)
     print(f"\n[track] 回填明细已存 {LOG2.name}")
+    # 沉淀报告到知识库（每日一份 + 滚动汇总）
+    _write_kb_report(out)
+
+
+def _write_kb_report(out):
+    """把追踪+分析结果沉淀为 Markdown 报告(每日一份+滚动汇总)，存档到知识库"""
+    import datetime as _dt
+    REPORT_DIR = Path(r"D:\AI_project\note\03_Agent_bA\00_量化架构\选股追踪")
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    today = _dt.date.today().isoformat()
+    lines = []
+    lines.append(f"# 选股追踪分析报告 {today}")
+    lines.append("")
+    # 命中率
+    lines.append("## 一、因子命中率")
+    for h in HORIZONS:
+        col = f"ret_{h}d"
+        if col in out.columns:
+            valid = out[col].dropna()
+            if len(valid) > 0:
+                hit = (valid > 0).mean() * 100
+                avg = valid.mean() * 100
+                lines.append(f"- 后续{h}日: 样本{len(valid)} | 命中率{hit:.0f}% | 均值{avg:+.2f}%")
+    lines.append("")
+    # 因子归因
+    lines.append("## 二、因子归因分析（哪个因子靠谱）")
+    bench_col = "ret_5d" if out["ret_5d"].notna().sum() >= 5 else "ret_1d"
+    fac_rows = []
+    import pandas as pd
+    if "factors" in out.columns and bench_col in out.columns:
+        for _, r in out.iterrows():
+            fac = str(r.get("factors") or "").strip()
+            if not fac or fac == "nan":
+                continue
+            ret = r.get(bench_col)
+            if pd.notna(ret):
+                for fname in [x.strip() for x in fac.split("|") if x.strip()]:
+                    fac_rows.append({"factors": fname, "ret": float(ret), "hit": float(ret) > 0})
+        if fac_rows:
+            fdf = pd.DataFrame(fac_rows)
+            agg = fdf.groupby("factors").agg(样本=("ret","size"), 命中率=("hit","mean"), 均值=("ret","mean"))
+            agg = agg[agg["样本"] >= 2].sort_values("均值", ascending=False)
+            for fac, r2 in agg.iterrows():
+                avg = r2["均值"] * 100; hit = r2["命中率"] * 100
+                tag = "✅可维持/加权" if avg > 1.0 and hit >= 50 else ("⚠️建议减权/淘汰" if avg < -1.0 else "中性")
+                lines.append(f"- {fac}: 样本{int(r2['样本'])} | 命中率{hit:.0f}% | 均值{avg:+.2f}% | {tag}")
+        else:
+            lines.append("- (归因样本不足)")
+    lines.append("")
+    # 盯盘提醒
+    lines.append("## 三、盯盘提醒（后续涨跌超阈值）")
+    fresh = out[out["pick_date"] >= pd.Timestamp("today").date() - pd.Timedelta(days=7)]
+    any_alert = False
+    for _, r in fresh.iterrows():
+        if pd.notna(r.get("total_ret")) and pd.notna(r.get("sel_price")):
+            tr = float(r["total_ret"])
+            if tr >= UP_ALERT or tr <= DOWN_ALERT:
+                lines.append(f"- {r['code']} | 选入{r['sel_price']:.2f} → 现价{float(r['latest_price']):.2f} | {tr:+.1%} 🚨")
+                any_alert = True
+    if not any_alert:
+        lines.append("- 无超阈值标的")
+    lines.append("")
+    lines.append("> 数据源 selection_log.csv｜短线样本少时结论仅供参考，积累更多样本才有统计意义")
+    report = "\n".join(lines)
+    # 每日一份
+    daily = REPORT_DIR / f"daily_{today}.md"
+    daily.write_text(report, encoding="utf-8")
+    print(f"[track] 报告已沉淀: {daily}")
+    # 滚动汇总（追加今日小节到 RUNNING_LOG）
+    runlog = REPORT_DIR / "累计分析.md"
+    with open(runlog, "a", encoding="utf-8") as f:
+        f.write(f"\n---\n\n{report}\n")
+    print(f"[track] 已追加到累计分析.md")
 
 
 if __name__ == "__main__":
