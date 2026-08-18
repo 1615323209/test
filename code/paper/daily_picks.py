@@ -110,7 +110,10 @@ def main():
     hs_close = h['close'][0] if len(h) > 0 else None
     hs_above = hs_close is not None and hs_ma20 is not None and hs_close > hs_ma20
     print(f"涨停家数: {m['涨停家数']}  跌停: {m['跌停家数']}  上涨占比: {m['上涨占比']*100:.1f}%")
-    print(f"沪深300: {hs_close:.0f} (MA20: {hs_ma20:.0f}) {'站上MA20' if hs_above else 'MA20下方'}")
+    hs_close_s = f"{hs_close:.0f}" if hs_close is not None else "暂无今日"
+    hs_ma20_s = f"{hs_ma20:.0f}" if hs_ma20 is not None else "—"
+    hs_pos = "站上MA20" if hs_above else ("MA20下方" if hs_close is not None else "")
+    print(f"沪深300: {hs_close_s} (MA20: {hs_ma20_s}) {hs_pos}")
     north = m.get('北向净买入')
     print(f"北向净买入: {north if north is not None else '无数据'}")
     conds = sum([hs_above, m['涨停家数'] > 60, north is not None and north > 0])
