@@ -23,12 +23,12 @@ MARKET = DATA / "market_daily.parquet"
 HS300 = DATA / "hs300.parquet"
 
 INIT_CAPITAL = 20000
-N_SLOTS = 10
-POSITION = 2000
-STOP_LOSS = -0.08
-TP = 0.12
-TIME_STOP_DAYS = 20
-TIME_STOP_GAIN = 0.05
+N_SLOTS = 4  # 流程改造阶段4: 10→4 仓(4×5000=2万)
+POSITION = 5000  # 流程改造阶段4: 2000→5000 元/仓
+STOP_LOSS = -0.04  # 流程改造阶段4: -8%→-4% (5日尺度)
+TP = 0.06  # 流程改造阶段4: 12%→6% (5日尺度)
+TIME_STOP_DAYS = 5  # 流程改造阶段4: 20→5 日(对齐 fwd_5d 标签口径)
+TIME_STOP_GAIN = 0.05  # 保留: 5日内未达6%即时间止损
 MIN_CASH = 2000
 PROTECT_GAIN = 0.03
 TOP_N = 3

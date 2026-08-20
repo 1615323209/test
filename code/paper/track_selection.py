@@ -91,7 +91,7 @@ def record_today():
     for _, r in df.iterrows():
         raw = r.get("代码", "")
         code = str(int(float(raw))).zfill(6) if str(raw).replace(".0", "").isdigit() else str(raw).zfill(6)
-        sel_price = r.get("收盘", 0)
+        sel_price = r.get("实盘价", r.get("收盘", 0))  # A1兼容: 新picks用实盘价, 旧用收盘
         score = r.get("评分", "")
         factors = r.get("top_factors", r.get("归因", ""))
         rows.append({"pick_date": pick_date, "code": code, "sel_price": sel_price,

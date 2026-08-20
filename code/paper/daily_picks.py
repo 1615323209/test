@@ -193,13 +193,27 @@ def main():
     ).collect()
     # 数据修复：主文件+增量合并可能有重复（同一股票同日多行），去重保留最后一条
     df = df.unique(subset=["日期", "股票代码"], keep="last")
+    # A1 价格口径修复（流程改造）：join 不复权价（实盘可买价），可买性过滤/股数用实盘价
+    _raw_path = DATA / "raw_close.parquet"
+    if _raw_path.exists():
+        try:
+            raw = pl.read_parquet(_raw_path).with_columns(pl.col("日期").str.to_date())
+            df = df.join(raw, on=["日期", "股票代码"], how="left")
+            print(f"  [A1] 已并入不复权价(实盘可买价), 覆盖 {df['收盘_不复权'].is_not_null().mean():.0%}")
+        except Exception as _e:
+            print(f"  ⚠️ 不复权价并入失败: {_e}，回退用复权价")
     df = df.filter(pl.col('日期') == target)
+    # 实盘价列（优先不复权，缺失回退复权）
+    df = df.with_columns(
+        pl.when(pl.col("收盘_不复权").is_not_null()).then(pl.col("收盘_不复权"))
+        .otherwise(pl.col("收盘")).alias("实盘价")
+    ) if "收盘_不复权" in df.columns else df.with_columns(pl.col("收盘").alias("实盘价"))
     
     cand = df.filter(
         (pl.col('is_suspended')==0)&(pl.col('limit_up')==0)&(pl.col('limit_down')==0)
         &(pl.col('price_pos_20')<0.85)&(pl.col('price_pos_20')>0.1)
         &(pl.col('收盘')>pl.col('ma_20'))
-        &(pl.col('收盘') < 19.5)   # 2000元/仓买得起100股（留滑点余量）
+        &(pl.col('实盘价') < 19.5)   # A1: 用实盘价过滤买得起（留滑点余量）
         &pl.col('turn_ma5').is_not_null()
         &pl.col('vol_change_5d').is_not_null()
         &pl.col('macd_dif').is_not_null()
@@ -237,7 +251,8 @@ def main():
     rows = []
     for r in top.iter_rows(named=True):
         code = r['股票代码']
-        price = float(r['收盘'])
+        price = float(r['实盘价'])  # A2: 股数用实盘价(不复权), 不再欠仓
+        price_hfq = float(r['收盘'])  # 复权价(仅供追踪)
         shares = int(POSITION/price/100)*100
         # top_factors 归因（贡献最大的 1-2 个）
         try:
@@ -251,7 +266,9 @@ def main():
         # 情绪分微调评分（[-0.05,+0.05]：负情绪降权，正情绪加权）
         adj_score = round(float(r['score']) + senti * 10.0, 1)
         rows.append({
-            '排名': len(rows)+1, '代码': code, '收盘': round(price,2),
+            '排名': len(rows)+1, '代码': code,
+            '实盘价': round(price,2),  # A1/A2: 实盘可买价(不复权)
+            '复权价': round(price_hfq,2),  # 复权价(供追踪/收益率)
             '评分': adj_score,
             '可买股数': shares if shares >= 100 else '不足100股',
             'ret_5d': round(r['ret_5d'],3), 'vol_ratio': round(r['vol_ratio'],2),
