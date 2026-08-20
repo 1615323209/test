@@ -10,7 +10,7 @@
   选股记录: D:/quant_data/daily_picks/selection_log.csv
   行情: factor_daily(+incr) 提供收盘价
 """
-import sys, os
+import sys, os, re
 from pathlib import Path
 import pandas as pd
 import polars as pl
@@ -74,10 +74,10 @@ def record_today():
     from datetime import datetime
     dstr = Path(newest).stem.replace("picks_", "")
     pick_date = datetime.strptime(dstr, "%Y-%m-%d").date()
-    # 幂等: 已记录过则跳过
+    # 幂等: 已记录过则跳过（E2修复: pick_date 统一转 str 再比较, 原 date vs str 恒False）
     if LOG.exists():
         old = pd.read_csv(LOG)
-        if pick_date in set(old["pick_date"]):
+        if str(pick_date) in set(old["pick_date"].astype(str)):
             print(f"[track] {pick_date} 已记录，跳过")
             return
     # 读选股结果
@@ -290,11 +290,26 @@ def _write_kb_report(out):
     daily = REPORT_DIR / f"daily_{today}.md"
     daily.write_text(report, encoding="utf-8")
     print(f"[track] 报告已沉淀: {daily}")
-    # 滚动汇总（追加今日小节到 RUNNING_LOG）
+    # 滚动汇总（E1修复: 按日 upsert——同日替换, 不同日追加, 不再重复堆叠）
     runlog = REPORT_DIR / "累计分析.md"
-    with open(runlog, "a", encoding="utf-8") as f:
-        f.write(f"\n---\n\n{report}\n")
-    print(f"[track] 已追加到累计分析.md")
+    today_hdr = f"# 选股追踪分析报告 {today}"
+    block = f"\n---\n\n{report}\n"
+    if runlog.exists():
+        cur = runlog.read_text(encoding="utf-8")
+        if today_hdr in cur:
+            # 同日已存在 → 替换该日小节（从该标题到下一个 --- 前）
+            import re as _re
+            pat = re.compile(_re.escape(today_hdr) + r".*?(?=\n---|\Z)", _re.S)
+            cur = pat.sub(report, cur)
+            runlog.write_text(cur, encoding="utf-8")
+            print(f"[track] 累计分析.md 已更新(同日替换 {today})")
+        else:
+            with open(runlog, "a", encoding="utf-8") as f:
+                f.write(block)
+            print(f"[track] 已追加到累计分析.md")
+    else:
+        runlog.write_text(report, encoding="utf-8")
+        print(f"[track] 累计分析.md 已创建")
 
 
 if __name__ == "__main__":

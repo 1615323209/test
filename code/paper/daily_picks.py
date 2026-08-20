@@ -114,7 +114,28 @@ def main():
         dates = pl.read_parquet(MARKET, columns=['日期'])['日期'].to_list()
         target = max(dates)
     print(f"=== 模拟盘选股 {target} ===\n")
-    
+
+    # E4 数据新鲜度门禁（流程改造）：因子数据滞后 ≥1 交易日警告, ≥2 拒绝出推荐
+    try:
+        fdates = []
+        for fp in ([FACTOR] + ([FACTOR_INCR] if FACTOR_INCR.exists() else [])):
+            fdates += pl.read_parquet(fp, columns=['日期'])['日期'].to_list()
+        fmax = max(fdates) if fdates else None
+        if fmax is not None:
+            # 交易日间隔（用 market_daily 的交易日序列数间隔）
+            alld = pl.read_parquet(MARKET, columns=['日期'])['日期'].to_list()
+            lag = 0
+            if target in alld and fmax in alld:
+                lag = alld.index(target) - alld.index(fmax)
+            if lag >= 2:
+                print(f"🚨 数据滞后 {lag} 个交易日（因子最新 {fmax}，目标 {target}）——拒绝出推荐")
+                import sys as _s
+                _s.exit(2)
+            elif lag >= 1:
+                print(f"⚠️ 数据滞后 {lag} 个交易日（因子最新 {fmax}），推荐基于旧数据")
+    except Exception as _e:
+        print(f"⚠️ 新鲜度检查失败: {_e}")
+
     # 市场状态
     market = pl.read_parquet(MARKET)
     m = market.filter(pl.col('日期') == target)
