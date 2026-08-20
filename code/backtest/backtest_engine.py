@@ -123,6 +123,12 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
     chunk = chunk.with_columns(
         pl.col('limit_up').rolling_sum(5, min_samples=5).over('股票代码').alias('limit_up_5d')
     )
+    # A1 价格口径（流程改造）：join 不复权价做可买性/股数，收益率仍用复权价
+    try:
+        raw = pl.read_parquet(DATA / "raw_close.parquet").with_columns(pl.col("日期").str.to_date())
+        chunk = chunk.join(raw, on=["日期", "股票代码"], how="left")
+    except Exception:
+        pass
     chunk = chunk.filter(pl.col('日期') >= datetime(start_year,1,1).date())
     chunk_dates = sorted(chunk['日期'].unique().to_list())
 
@@ -161,6 +167,7 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
                 if len(row_data) == 0: continue
                 row = row_data.row(0, named=True)
                 close = row['收盘']; ret1d = row['ret_1d']
+                raw_close = float(row.get('收盘_不复权') or close)  # A1: 实盘价(现金口径)
                 if ret1d is not None and ret1d <= -0.095: continue
                 cost = h['buy_price']
                 pnl = (close-cost)/cost
@@ -177,11 +184,12 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
                 if reason:
                     slip = slippage(ret1d)
                     sell_price = close*(1-slip)
+                    sell_price_cash = raw_close*(1-slip)  # A1: 实盘卖出价(现金口径)
                     sell_shares = int(h['shares']*sell_pct)
                     if sell_shares < 100: sell_shares = h['shares']
-                    sell_amt = sell_shares*sell_price
+                    sell_amt = sell_shares*sell_price_cash
                     fee = max(COMM_MIN, sell_amt*COMM_RATE) + sell_amt*STAMP_RATE
-                    profit = sell_shares*(sell_price-cost) - fee
+                    profit = sell_shares*sell_price_cash - sell_shares*h.get('cost_per_share', sell_price) - fee
                     all_trades.append({
                         'code': h['code'], 'buy_date': h['buy_date'],
                         'buy_price': cost, 'sell_date': today,
@@ -208,15 +216,18 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
                     for row in top.iter_rows(named=True):
                         code = row['股票代码']
                         slip = slippage(row['ret_1d'])
+                        # A1/A2: 股数与现金流用实盘价(不复权); 持仓盈亏判定仍用复权价(序列一致)
+                        raw_price = float(row.get('收盘_不复权') or row['收盘'])
                         buy_price = float(row['收盘'])*(1+slip)
-                        shares = int(POSITION/buy_price/100)*100
+                        shares = int(POSITION/raw_price/100)*100
                         if shares < 100: continue
-                        cost = shares*buy_price
-                        fee = max(COMM_MIN, cost*COMM_RATE)
-                        if cost+fee > cash: continue
-                        cash -= cost+fee
+                        cash_cost = shares*raw_price
+                        fee = max(COMM_MIN, cash_cost*COMM_RATE)
+                        if cash_cost+fee > cash: continue
+                        cash -= cash_cost+fee
                         holdings.append({'code':code,'buy_date':today,'buy_price':buy_price,
-                                         'shares':shares,'peak':buy_price,'half_sold':False})
+                                         'shares':shares,'peak':buy_price,'half_sold':False,
+                                         'cost_per_share':raw_price})  # A1: 实盘每股成本(现金口径)
         del sub; gc.collect()
         if verbose: print(f"  [诊断] cash={cash:.0f}, 持仓={len(holdings)}, 交易={len(all_trades)}")
 
@@ -228,11 +239,13 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
             if len(row_data) > 0:
                 row = row_data.row(0, named=True)
                 close, ret1d = row['收盘'], row['ret_1d']
+                raw_close = float(row.get('收盘_不复权') or close)  # A1: 实盘价
                 slip = slippage(ret1d)
                 sell_price = close*(1-slip)
-                sell_amt = h['shares']*sell_price
+                sell_price_cash = raw_close*(1-slip)
+                sell_amt = h['shares']*sell_price_cash
                 fee = max(COMM_MIN, sell_amt*COMM_RATE) + sell_amt*STAMP_RATE
-                profit = h['shares']*(sell_price-h['buy_price']) - fee
+                profit = h['shares']*(sell_price_cash-h.get('cost_per_share', h['buy_price'])) - fee
                 all_trades.append({
                     'code': h['code'], 'buy_date': h['buy_date'],
                     'buy_price': h['buy_price'], 'sell_date': last,
