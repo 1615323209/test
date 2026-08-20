@@ -203,6 +203,16 @@ def main():
         except Exception as _e:
             print(f"  ⚠️ 不复权价并入失败: {_e}，回退用复权价")
     df = df.filter(pl.col('日期') == target)
+    # 龙虎榜净买额因子（事件信号, 4年分年验证: 净买Top20% +2.2%, Bottom20% -2.7%）
+    try:
+        from paper.lhb_factor import load_lhb_factor
+        lhb = load_lhb_factor()
+        if lhb is not None:
+            df = df.join(lhb, on=["日期", "股票代码"], how="left")
+            df = df.with_columns(pl.col("lhb_netbuy").fill_null(0.0).alias("lhb_netbuy"),
+                                 pl.col("lhb_up").fill_null(0).alias("lhb_up"))
+    except Exception as _e:
+        print(f"  ⚠️ 龙虎榜因子并入失败: {_e}")
     # 实盘价列（优先不复权，缺失回退复权）
     df = df.with_columns(
         pl.when(pl.col("收盘_不复权").is_not_null()).then(pl.col("收盘_不复权"))
@@ -277,12 +287,15 @@ def main():
             '站上MA20': round(r['ma_20'],2), 'price_pos': round(r['price_pos_20'],2),
             'top_factors': top_factors,  # 改造2.0 2.2：归因（供 --from-pick / L4）
             '新闻情绪': round(senti, 2),  # 新闻情绪因子
+            '龙虎榜净买': round(r.get('lhb_netbuy', 0.0), 0) if r.get('lhb_up', 0) == 1 else 0,  # 龙虎榜因子
+            '龙虎榜上榜': 1 if r.get('lhb_up', 0) == 1 else 0,
         })
         s_tag = ("🔴利空" if senti < -0.3 else ("🟢利好" if senti > 0.3 else "中性"))
         print(f"  {rows[-1]['排名']}. {_cname(code)} ({code})  收盘{price:.2f}  评分{rows[-1]['评分']}  "
               f"{'可买'+str(shares)+'股' if shares>=100 else '不足100股'}")
         print(f"     ret_5d={r['ret_5d']:.3f} vol={r['vol_ratio']:.2f} turn={r['turn_ratio']:.2f} "
-              f"涨停5d={int(r['limit_up_5d'])} pos={r['price_pos_20']:.2f} 归因={top_factors} 新闻情绪{senti:+.2f}{s_tag}")
+              f"涨停5d={int(r['limit_up_5d'])} pos={r['price_pos_20']:.2f} 归因={top_factors} 新闻情绪{senti:+.2f}{s_tag}"
+              + (f" 🐉龙虎榜净买{r.get('lhb_netbuy',0)/1e8:+.1f}亿" if r.get('lhb_up',0)==1 else ""))
     if fallback:
         print("\n⚠️ 使用 v7 基线回退（active_factors 不可用）")
 
