@@ -81,6 +81,7 @@ def main():
     print(f"已完成 {len(done_days)} 天, 待采 {len(todo)} 天")
 
     t0 = time.time()
+    buf = []
     for i, day in enumerate(todo):
         rows, total = fetch_day(day)
         all_rows = []
@@ -94,15 +95,23 @@ def main():
                     all_rows += [to_row(r) for r in rows2]
                 time.sleep(0.3)
         if all_rows:
-            df = pl.DataFrame(all_rows)
+            buf += all_rows
+        # 每 50 天批量落盘一次（避免每天全量读+合并）
+        if buf and (i + 1) % 50 == 0:
+            df = pl.DataFrame(buf)
             if OUT.exists():
                 old_all = pl.read_parquet(OUT)
-                merged = pl.concat([old_all, df]).unique(subset=["日期", "代码"], keep="first")
-            else:
-                merged = df
-            merged.write_parquet(OUT, compression="zstd")
-        if (i + 1) % 10 == 0:
-            print(f"  {i+1}/{len(todo)} 天, 累计 {sum(1 for _ in open(OUT)) if OUT.exists() else 0} 行? {time.time()-t0:.0f}s")
+                df = pl.concat([old_all, df]).unique(subset=["日期", "代码"], keep="first")
+            df.write_parquet(OUT, compression="zstd")
+            buf = []
+            print(f"  {i+1}/{len(todo)} 天, {time.time()-t0:.0f}s")
+    # 剩余批量
+    if buf:
+        df = pl.DataFrame(buf)
+        if OUT.exists():
+            old_all = pl.read_parquet(OUT)
+            df = pl.concat([old_all, df]).unique(subset=["日期", "代码"], keep="first")
+        df.write_parquet(OUT, compression="zstd")
     # 最终统计
     if OUT.exists():
         fin = pl.read_parquet(OUT)
