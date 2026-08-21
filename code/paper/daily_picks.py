@@ -249,14 +249,8 @@ def main():
                 senti_map[c] = 0.0
     except Exception:
         pass
-    # 改造2.0 2.2：每只入选股算 top_factors 贡献归因（s_i × weight 排序取前2）
+    # 改造2.0 2.2：每只入选股算 top_factors 贡献归因（中心化后排序取前2, P1-6）
     fa_cols = [f"__{f['name']}" for f in active_factors]
-    if fa_cols:
-        top = top.with_columns(
-            sum(pl.col(fa_cols[i]) * active_factors[i]["weight"] for i in range(len(fa_cols))).alias("_contrib_check"))
-        # 逐行取贡献最大的 1-2 个因子
-        top = top.with_columns(pl.concat_list(fa_cols).alias("_ranked"))
-
     print("=== Top 5 候选 ===")
     rows = []
     for r in top.iter_rows(named=True):
@@ -266,7 +260,11 @@ def main():
         shares = int(POSITION/price/100)*100
         # top_factors 归因（贡献最大的 1-2 个）
         try:
-            contribs = [(active_factors[i]["name"], r.get(fa_cols[i], 0) * active_factors[i]["weight"])
+            # P1-6(v4.1复核): 归因中心化——(rank-(N+1)/2)/N × weight, 正负都有意义
+            # (原: 全正 rank×weight 系统性偏向高权重因子)
+            n_cand = len(cand)
+            contribs = [(active_factors[i]["name"],
+                         (r.get(fa_cols[i], 0) - (n_cand + 1) / 2) / n_cand * active_factors[i]["weight"])
                         for i in range(len(fa_cols))]
             contribs.sort(key=lambda x: abs(x[1]), reverse=True)
             top_factors = "|".join(n for n, _ in contribs[:2])

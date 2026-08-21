@@ -45,28 +45,33 @@ def main():
     limit = None
     if "--limit" in sys.argv:
         limit = int(sys.argv[sys.argv.index("--limit") + 1])
-    # 代码清单
-    codes = [str(r[0]).zfill(6) for r in
-             pl.read_csv(DATA / "code_name_map.csv", schema_overrides={"代码": pl.Utf8}).select("代码").iter_rows()]
+    # P1-8(v4.1复核): 代码清单取自 factor_daily 全集(含退市), 而非 code_name_map(仅当前上市)
+    codes = sorted(set(
+        str(r[0]).zfill(6) for r in
+        pl.scan_parquet(DATA / "factor_daily.parquet", columns=["股票代码"]).unique().collect().iter_rows()))
     if limit:
         codes = codes[:limit]
     t0 = time.time()
     all_rows = []
+    fails = []
     done = 0
     for code in codes:
         rows = []
         for y in YEARS:
             rows += fetch_raw(code, y)
             time.sleep(0.05)
-        if rows:
-            # 去重(跨年边界)
-            seen = set()
-            uniq = []
-            for d, c in rows:
-                if d not in seen:
-                    seen.add(d)
-                    uniq.append((d, code, c))
-            all_rows += uniq
+        if not rows:
+            fails.append(code)  # P1-8: 记录失败清单
+            done += 1
+            continue
+        # 去重(跨年边界)
+        seen = set()
+        uniq = []
+        for d, c in rows:
+            if d not in seen:
+                seen.add(d)
+                uniq.append((d, code, c))
+        all_rows += uniq
         done += 1
         if done % 100 == 0:
             print(f"  {done}/{len(codes)} 只, 累计{len(all_rows)}行, {time.time()-t0:.0f}s")
@@ -75,19 +80,40 @@ def main():
             all_rows = []
     if all_rows:
         _save(all_rows)
+    # P1-8: 失败清单落盘
+    if fails:
+        Path(DATA / "raw_close_fails.txt").write_text("\n".join(fails), encoding="utf-8")
+        print(f"[警告] {len(fails)} 只拉取失败: {fails[:10]}... 清单已存 raw_close_fails.txt")
     print(f"[完成] {done} 只不复权收盘价 -> {OUT}")
 
 
 def _save(rows):
+    """P1-9(v4.1复核): 分片落盘(每片独立文件, 避免O(n²)全量读+合并); 用 --merge 一次性合并回主文件"""
     df = pl.DataFrame(rows, schema={"日期": pl.Utf8, "股票代码": pl.Utf8, "收盘_不复权": pl.Float64},
                       orient="row")
+    part = DATA / f"raw_close_part_{int(time.time()*1000)}.parquet"
+    df.write_parquet(part, compression="zstd")
+
+
+def merge_parts():
+    """把分片合并回主文件(去重), 删除分片"""
+    parts = sorted(Path(DATA).glob("raw_close_part_*.parquet"))
+    if not parts:
+        print("无分片")
+        return
+    dfs = [pl.read_parquet(p) for p in parts]
+    merged = pl.concat(dfs).unique(subset=["日期", "股票代码"], keep="last")
     if OUT.exists():
         old = pl.read_parquet(OUT)
-        merged = pl.concat([old, df]).unique(subset=["日期", "股票代码"], keep="last")
-        merged.write_parquet(OUT, compression="zstd")
-    else:
-        df.write_parquet(OUT, compression="zstd")
+        merged = pl.concat([old, merged]).unique(subset=["日期", "股票代码"], keep="last")
+    merged.write_parquet(OUT, compression="zstd")
+    for p in parts:
+        p.unlink()
+    print(f"[merge] 合并 {len(parts)} 分片 → {OUT} ({len(merged)} 行)")
 
 
 if __name__ == "__main__":
-    main()
+    if "--merge" in sys.argv:
+        merge_parts()
+    else:
+        main()
