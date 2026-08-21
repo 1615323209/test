@@ -282,7 +282,7 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
         if verbose: print(f"  [诊断] cash={cash:.0f}, 持仓={len(holdings)}, 交易={len(all_trades)}")
 
     if holdings:
-        last = dates[-1]
+        last = chunk_dates[-1]  # C2(v4.2): 用chunk的最后一个交易日(与DIDX一致; 原dates[-1]来自market_daily可能不在DIDX)
         last_chunk = chunk.filter(pl.col('日期') == last)
         for h in holdings:
             row_data = last_chunk.filter(pl.col('股票代码') == h['code'])
@@ -317,6 +317,26 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
                     'price_src': h.get('price_src', 'raw')
                 })
                 cash += sell_amt - sell_fee
+            else:
+                # C2(v4.2): 最后一天无数据(停牌/退市)——按成本清算, 盈亏0, 摊买入佣金
+                sell_fee = 0.0
+                buy_fee_alloc = h.get('buy_fee', 0) * (h['shares'] / h['shares0'])
+                fee = buy_fee_alloc
+                notional = h['shares'] * h.get('cost_per_share', h['buy_price'])
+                cash_ret = 0.0
+                all_trades.append({
+                    'code': h['code'], 'buy_date': h['buy_date'],
+                    'buy_price': h['buy_price'], 'sell_date': last,
+                    'sell_price': h.get('cost_per_share', h['buy_price']), 'shares': h['shares'],
+                    'pnl': -fee, 'pnl_pct': 0.0,
+                    'px_ret_pct': 0.0, 'hfq_ret_pct': 0.0,
+                    'net_ret_pct': -fee/notional*100 if notional > 0 else 0,
+                    'notional': notional,
+                    'fee': fee, 'reason': '强制平仓-无数据',
+                    'held_days': DIDX[last] - DIDX[h['buy_date']],
+                    'price_src': 'no_data'
+                })
+                cash += h['shares'] * h.get('cost_per_share', h['buy_price'])  # 收回本金
 
     trades = pd.DataFrame(all_trades)
     if len(trades) == 0:
