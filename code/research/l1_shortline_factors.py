@@ -44,11 +44,12 @@ for f in FACTORS:
         continue
     icm = float(np.mean(ics))
     t = newey_west_t(ics)
-    icir = icm / (np.std(ics) + 1e-12) * np.sqrt(len(ics))
+    icir = icm / (np.std(ics) + 1e-12)  # v4.1复核 P0-3: 经典ICIR, 不乘sqrtN
+    icir_ann = icir * np.sqrt(252)
     # Top5 毛收益（按因子值高排名）
     top5 = (d.select(["日期", pl.col(f).rank(descending=True).over("日期").alias("rk"), "fwd_5d"])
             .filter(pl.col("rk") <= 5))
     t5 = float(top5["fwd_5d"].mean()) if len(top5) else None
     clear = "✅清线" if (t5 or 0) >= 0.0045 else ""
     t5s = f"{t5*100:+.2f}%" if t5 is not None else "N/A"
-    print(f"{f}: IC={icm:+.4f} ICIR={icir:+.2f} t_NW={t:+.2f} | Top5_5d={t5s} {clear}")
+    print(f"{f}: IC={icm:+.4f} ICIR={icir:+.3f} ICIR_ann={icir_ann:+.3f} t_NW={t:+.2f} | Top5_5d={t5s} {clear}")

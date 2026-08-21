@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""流程改造阶段1: go/no-go 因子×周期网格测算
-对现有因子(45价量+v7六+扩展5) 算 fwd_1d/5d/10d/20d 各周期的 IC/ICIR/t_NW(设计段2021-2023)
-+ 每日 Top-N(按截面rank前N) 的毛收益均值 vs 5000元仓成本线(0.45%)
+"""流程改造阶段1: go/no-go 因子×周期网格测算 v2 (v4.1复核 P0-2/P0-3 修正版)
 
-产出: docs/选股追踪/go_nogo_grid_{date}.md
-判定:
-  - 5日列有因子清线(毛收益>=0.45%) → 按第二章推进
-  - 各周期全空 → 补数据源(资金流/龙虎榜), 省掉后续工程量
+修正点:
+- P0-2a: 双端都报(Top5_高端/Top5_低端), 拟交易端=IC符号决定, 清线只认拟交易端
+- P0-2b: 可交易性过滤(is_suspended==0, limit_up==0, limit_down==0) 与回测候选池一致
+- P0-2c: 离散/二值因子(unique<20)改用分组均值, 不参与Top-N清线判定
+- P0-2d: 设计段2021-2023 + 留出段2024 各跑一遍, 两段同方向且都清线才标✅
+- P0-3: ICIR 为经典 mean/std(不乘sqrtN), 输出列 IC/ICIR/ICIR_ann/t_NW
+产出: docs/选股追踪/go_nogo_grid_v2_{date}.md
 """
 import sys, glob
 from pathlib import Path
@@ -15,115 +16,142 @@ import polars as pl
 import numpy as np
 import datetime as dt
 from loop.factor_loop_l1l2 import newey_west_t
+from scipy.stats import spearmanr
 
 IC_DATA = r"D:/quant_data/ic_data.parquet"
 COST_LINE = 0.0045  # 5000元仓往返成本率 0.45%
 HORIZONS = ["fwd_1d", "fwd_5d", "fwd_10d", "fwd_20d"]
-TOP_N = 5  # 每日取前 N
+TOP_N = 5
+DESIGN = (pl.date(2021, 1, 1), pl.date(2023, 12, 31))
+HOLDOUT = (pl.date(2024, 1, 1), pl.date(2024, 12, 31))
 
-# 因子列(价量45 + 扩展5 + v7相关), 排除非因子列/标签列
 EXCLUDE = {"日期", "开盘", "收盘", "最高", "最低", "成交量", "turnover", "成交额", "股票代码",
            "开盘_right", "最高_right", "最低_right", "is_suspended", "limit_up", "limit_down"}
-FACTOR_COLS = [c for c in pl.read_parquet(IC_DATA).columns if c not in EXCLUDE and not c.startswith("fwd_")]
 
-# v7 六因子(与 backtest_engine.V7_BASE_FACTORS 一致)
-V7_FACTORS = ['s1', 's2', 's3', 's4', 's5', 's6']
+
+def tradeable(d):
+    """可交易性过滤（与回测候选池一致）"""
+    return d.filter((pl.col("is_suspended") == 0) & (pl.col("limit_up") == 0) & (pl.col("limit_down") == 0))
+
+
+def daily_ic(sub, col, label):
+    """单日 Spearman IC"""
+    if len(sub) < 20:
+        return None
+    try:
+        rho, _ = spearmanr(sub[col].to_numpy(), sub[label].to_numpy())
+        return rho if np.isfinite(rho) else None
+    except Exception:
+        return None
+
+
+def factor_stats(d, col, label):
+    """单段: 逐日IC → IC/ICIR/ICIR_ann/t_NW + 双端Top-N毛收益
+    返回 dict 或 None(样本不足)"""
+    dd = d.filter(pl.col(col).is_not_null() & pl.col(label).is_not_null())
+    if len(dd) < 10000:
+        return None
+    # 逐日 IC
+    ics = []
+    for day in dd["日期"].unique().to_list():
+        sub = dd.filter(pl.col("日期") == day)
+        rho = daily_ic(sub, col, label)
+        if rho is not None:
+            ics.append(rho)
+    if len(ics) < 50:
+        return None
+    icm = float(np.mean(ics))
+    icir = icm / (np.std(ics) + 1e-12)
+    t = newey_west_t(ics)
+    # 双端 Top-N
+    rk_desc = pl.col(col).rank(descending=True).over("日期")
+    rk_asc = pl.col(col).rank(descending=False).over("日期")
+    hi = dd.select(["日期", rk_desc.alias("rk"), label]).filter(pl.col("rk") <= TOP_N)
+    lo = dd.select(["日期", rk_asc.alias("rk"), label]).filter(pl.col("rk") <= TOP_N)
+    hi_r = float(hi[label].mean()) if len(hi) else None
+    lo_r = float(lo[label].mean()) if len(lo) else None
+    # 涨停股占 Top5 比例(应=0, 可交易性过滤后)
+    lu_hi = dd.select(["日期", rk_desc.alias("rk"), "limit_up"]).filter(pl.col("rk") <= TOP_N)
+    lu_ratio = float(lu_hi["limit_up"].sum()) / len(lu_hi) if len(lu_hi) else 0
+    return {"ic": icm, "icir": icir, "icir_ann": icir * np.sqrt(252), "t": t,
+            "hi": hi_r, "lo": lo_r, "lu_ratio": lu_ratio, "n_ic": len(ics)}
+
+
+def discrete_group(d, col, label):
+    """离散/二值因子: 分组均值"""
+    dd = d.filter(pl.col(col).is_not_null() & pl.col(label).is_not_null())
+    if len(dd) < 5000:
+        return None
+    grp = dd.group_by(col).agg(pl.col(label).mean().alias("ret"), pl.len().alias("n")).sort(col)
+    return {r[col]: (round(r["ret"], 5), r["n"]) for r in grp.to_dicts()}
 
 
 def main():
-    ic = pl.read_parquet(IC_DATA)
-    ic = ic.filter((pl.col("日期") >= pl.date(2021, 1, 1)) & (pl.col("日期") <= pl.date(2023, 12, 31)))
-    print(f"设计段样本: {len(ic):,} 行, {ic['日期'].n_unique()} 天")
+    # 只读需要的列(降低内存峰值, 避免OOM)
+    need = ["日期", "股票代码", "fwd_5d", "is_suspended", "limit_up", "limit_down"]
+    ic_all = pl.read_parquet(IC_DATA, columns=need)
+    FACTOR_COLS = [c for c in pl.read_parquet(IC_DATA).columns
+                   if c not in EXCLUDE and not c.startswith(("fwd_", "ret_"))]
 
-    results = []
+    ic_design = tradeable(ic_all.filter((pl.col("日期") >= DESIGN[0]) & (pl.col("日期") <= DESIGN[1])))
+    ic_hold = tradeable(ic_all.filter((pl.col("日期") >= HOLDOUT[0]) & (pl.col("日期") <= HOLDOUT[1])))
+    print(f"设计段: {len(ic_design):,} 行 / {ic_design['日期'].n_unique()} 天")
+    print(f"留出段: {len(ic_hold):,} 行 / {ic_hold['日期'].n_unique()} 天")
+
+    out_lines = [f"# go/no-go 因子×周期网格 v2 ({dt.date.today()})",
+                 "",
+                 "> v4.1复核修正: 双端判定/可交易性过滤/离散分组均值/留出段2024/真ICIR(P0-2,P0-3)",
+                 f"> 成本线 {COST_LINE*100:.2f}% ｜ 拟交易端=IC符号决定 ｜ 两段同方向且都清线才标 ✅",
+                 ""]
+    # 表头
+    hdr = (f"| 因子 | IC | ICIR | ICIR_ann | t_NW | 设计段_高端% | 设计段_低端% | 拟交易端 | "
+           f"设计段清线% | 留出段清线% | 双段✅ | 涨停占比 |")
+    out_lines += [hdr, "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+
+    n_clear = 0
     for col in FACTOR_COLS:
-        if col.startswith(("fwd_", "ret_") ):
+        # 按需读取该因子列(避免全量载入所有因子列, 降内存峰值)
+        fcol = pl.read_parquet(IC_DATA, columns=["日期", "股票代码", col])
+        d_design = ic_design.join(fcol, on=["日期", "股票代码"], how="left")
+        d_hold = ic_hold.join(fcol, on=["日期", "股票代码"], how="left")
+        # 离散因子: 分组均值, 不参与Top-N清线
+        if d_design[col].n_unique() < 20:
+            gd = discrete_group(d_design, col, "fwd_5d")
+            gh = discrete_group(d_hold, col, "fwd_5d") if d_hold[col].n_unique() < 20 else None
+            gd_s = ";".join(f"{k}:{v[0]*100:.2f}%(n={v[1]})" for k, v in (gd or {}).items()) or "样本不足"
+            out_lines.append(f"| {col} | - | - | - | - | - | - | 离散(分组) | {gd_s[:60]} | "
+                             f"{(';'.join(f'{k}:{v[0]*100:.2f}%' for k,v in (gh or {}).items()))[:60] if gh else '-'} | - | - |")
             continue
-        # 过滤该因子非空
-        d = ic.filter(pl.col(col).is_not_null() & pl.col("fwd_5d").is_not_null())
-        if len(d) < 10000:
+        # 连续因子: 双端
+        sd = factor_stats(d_design, col, "fwd_5d")
+        if sd is None:
             continue
-        # 逐日横截面 rank 值(反序: 因子值越大 score 越高, 我们测原始方向)
-        daily = (d.select(["日期", col, "fwd_1d", "fwd_5d", "fwd_10d", "fwd_20d"])
-                 .group_by("日期")
-                 .map_groups(lambda g: _daily_stats(g, col)))
-        daily = daily.filter(pl.col("n") >= 20)
-        if len(daily) < 100:
-            continue
-        row = {"因子": col}
-        for hz in HORIZONS:
-            ics = daily.filter(pl.col("ic_ok")).select(pl.col("ic_" + hz)).to_series().to_list()
-            if len(ics) < 50:
-                row[hz + "_ICIR"], row[hz + "_t"] = None, None
-                continue
-            icm = float(np.mean(ics))
-            t = newey_west_t(ics)
-            row[hz + "_ICIR"] = round(icm / (np.std(ics) + 1e-12) * np.sqrt(len(ics)), 3) if np.std(ics) > 0 else 0.0
-            row[hz + "_t"] = round(t, 2)
-        # Top-N 毛收益(5日)
-        top5 = (d.select(["日期", pl.col(col).rank(descending=True).over("日期").alias("rk"), "fwd_5d"])
-                .filter(pl.col("rk") <= TOP_N))
-        row["Top5_5d毛收益"] = round(float(top5["fwd_5d"].mean()), 4) if len(top5) else None
-        row["Top5_n"] = len(top5)
-        results.append(row)
+        sh = factor_stats(d_hold, col, "fwd_5d")
+        # 拟交易端
+        side = "高端" if sd["ic"] >= 0 else "低端"
+        ret_d = sd["hi"] if side == "高端" else sd["lo"]
+        ret_h = (sh["hi"] if side == "高端" else sh["lo"]) if sh else None
+        clear_d = (ret_d or 0) >= COST_LINE
+        clear_h = (ret_h or 0) >= COST_LINE if ret_h is not None else False
+        both = "✅" if (clear_d and clear_h) else ""
+        if clear_d and clear_h:
+            n_clear += 1
+        lu = sd["lu_ratio"]
+        out_lines.append(
+            f"| {col} | {sd['ic']:+.4f} | {sd['icir']:+.3f} | {sd['icir_ann']:+.3f} | {sd['t']:+.2f} | "
+            f"{sd['hi']*100 if sd['hi'] is not None else 0:+.2f} | {sd['lo']*100 if sd['lo'] is not None else 0:+.2f} | "
+            f"{side} | {ret_d*100 if ret_d is not None else 0:+.2f} | "
+            f"{ret_h*100 if ret_h is not None else 0:+.2f} | {both} | {lu*100:.0f}% |")
 
-    # 输出 + 判定
-    import pandas as pd
-    grid = pd.DataFrame(results)
-    out_lines = [f"# go/no-go 因子×周期网格 ({dt.date.today()})", "",
-                 f"> 设计段 2021-2023 ｜ 成本线 0.45%(5000元4仓) ｜ 因子 {len(grid)} 个",
-                 "> 判定: 5日列毛收益 ≥0.45% 清线 → 按流程改造推进; 各周期全空 → 补数据源", ""]
-    # 按 5日毛收益排序
-    grid = grid.sort_values("Top5_5d毛收益", ascending=False)
-    out_lines.append("| 因子 | 1d_ICIR | 1d_t | 5d_ICIR | 5d_t | 10d_ICIR | 10d_t | 20d_ICIR | 20d_t | Top5_5d毛收益% |")
-    out_lines.append("|---|---|---|---|---|---|---|---|---|---|")
-    n_clear5 = 0
-    for _, r in grid.iterrows():
-        clear = "✅" if (r["Top5_5d毛收益"] or 0) >= COST_LINE else ""
-        if clear:
-            n_clear5 += 1
-        def f(v, pct=False):
-            if v is None or (isinstance(v, float) and np.isnan(v)):
-                return "-"
-            return f"{v*100:.2f}%" if pct else str(v)
-        out_lines.append(f"| {r['因子']} | {f(r.get('fwd_1d_ICIR'))} | {f(r.get('fwd_1d_t'))} | "
-                         f"{f(r.get('fwd_5d_ICIR'))} | {f(r.get('fwd_5d_t'))} | "
-                         f"{f(r.get('fwd_10d_ICIR'))} | {f(r.get('fwd_10d_t'))} | "
-                         f"{f(r.get('fwd_20d_ICIR'))} | {f(r.get('fwd_20d_t'))} | "
-                         f"{f(r['Top5_5d毛收益'], True)} {clear} |")
-    out_lines += ["", f"**5日清线因子数: {n_clear5} / {len(grid)}**",
-                  "", "## 判定",
-                  "- ✅ 5日列有因子清线 → 按流程改造第二章推进(5日持仓4仓×5000)",
-                  "- ❌ 各周期全空 → alpha不存在于价量特征空间, 转向补数据源(资金流/龙虎榜)"]
-    # v7 特别标注
-    out_lines += ["", "## v7 六因子单独行情"] 
-    for v7 in V7_FACTORS:
-        pass  # v7 是合成打分不是单列, 在上面网格里已覆盖其组成因子(如 macd_dif 等)
-
+    out_lines += ["", f"**双段清线因子数: {n_clear}**", "",
+                  "## 判定",
+                  "- ✅ 拟交易端+留出段双清线 → alpha 存在且跨段稳定, 可作策略起点",
+                  "- ❌ 无双段清线 → 价量特征空间在可交易+成本口径下无可交易 alpha, 转向补数据源"]
     report = "\n".join(out_lines)
-    out_path = Path(f"D:/quant_project/docs/选股追踪/go_nogo_grid_{dt.date.today()}.md")
+    out_path = Path(f"D:/quant_project/docs/选股追踪/go_nogo_grid_v2_{dt.date.today()}.md")
     out_path.write_text(report, encoding="utf-8")
     print(report)
     print(f"\n[已存] {out_path}")
-
-
-def _daily_stats(g, col):
-    """单日: 该因子的 IC(各horizon) + 样本数"""
-    n = len(g)
-    out = {"日期": g["日期"][0], "n": n, "ic_ok": n >= 20}
-    for hz in HORIZONS:
-        x = g[col].to_numpy()
-        y = g[hz].to_numpy()
-        if len(x) < 5:
-            out["ic_" + hz] = None
-            continue
-        from scipy.stats import spearmanr
-        try:
-            rho, _ = spearmanr(x, y)
-            out["ic_" + hz] = rho if np.isfinite(rho) else None
-        except Exception:
-            out["ic_" + hz] = None
-    return pl.DataFrame([out])
 
 
 if __name__ == "__main__":
