@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """新因子池(反转6+近5日涨停) vs v7 基线 —— 5日/4仓5000/实盘口径对比回测
 """
+import os
 import sys
-sys.path.insert(0, r"D:/quant_project/code")
+from pathlib import Path
+PROJ = Path(os.environ.get("QUANT_PROJECT", r"D:/quant_project"))
+sys.path.insert(0, str(PROJ / "code"))
 from backtest.backtest_engine import run_backtest
 
 # v4.1复核 P0-1: 修正因子定义(纯新池, include_base=False)

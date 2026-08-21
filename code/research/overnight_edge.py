@@ -22,7 +22,7 @@ fullday = 次日收盘 / 今日收盘 - 1 （= 现有 fwd_1d 口径）
 import polars as pl
 from pathlib import Path
 
-DATA = Path("D:/quant_data")
+DATA = Path(os.environ.get("QUANT_DATA", "D:/quant_data"))
 FACTOR = DATA / "factor_daily.parquet"
 FACTOR_INCR = DATA / "factor_daily_incr.parquet"
 RAW = DATA / "a_stock_daily_hfq.parquet"

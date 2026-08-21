@@ -1,8 +1,11 @@
 """龙虎榜因子 L1 体检（设计段2021-2023, fwd_5d）——上榜/净买/机构/D5表现
 龙虎榜是非价量长历史信号(替代板块资金), 检验它在5日周期的预测力
 """
+import os
 import sys
-sys.path.insert(0, r"D:/quant_project/code")
+from pathlib import Path
+PROJ = Path(os.environ.get("QUANT_PROJECT", r"D:/quant_project"))
+sys.path.insert(0, str(PROJ / "code"))
 import polars as pl
 import numpy as np
 from loop.factor_loop_l1l2 import newey_west_t

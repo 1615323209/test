@@ -7,9 +7,11 @@ E3: 持满5日+无择时+无动量筛 | turn_ratio(动量筛值多少钱, 与网
 E4: 持满5日+无择时+无动量筛 | 四因子等权(真正的目标问题)
 产出: docs/选股追踪/B2_梯度隔离_YYYY-MM-DD.md
 """
-import sys, datetime as dt
-sys.path.insert(0, r"D:/quant_project/code")
-from pathlib import Path
+import os
+import sys
+from pathlib import Path, datetime as dt
+PROJ = Path(os.environ.get("QUANT_PROJECT", r"D:/quant_project"))
+sys.path.insert(0, str(PROJ / "code"))
 from backtest.backtest_engine import run_backtest
 
 OUT = Path(f"D:/quant_project/docs/选股追踪/B2_梯度隔离_{dt.date.today()}.md")

@@ -5,10 +5,12 @@ v4.2修正:
 - A3: 判定文字全部从 metrics 生成, 禁止数字字面量
 产出: docs/选股追踪/v4.1_重跑总表_2026-08-21.md (覆盖更新)
 """
-import sys, os
-sys.path.insert(0, r"D:/quant_project/code")
+import os
+import sys
+from pathlib import Path, os
+PROJ = Path(os.environ.get("QUANT_PROJECT", r"D:/quant_project"))
+sys.path.insert(0, str(PROJ / "code"))
 import datetime as dt
-from pathlib import Path
 from backtest.backtest_engine import run_backtest
 
 OUT = Path(r"D:/quant_project/docs/选股追踪/v4.1_重跑总表_2026-08-21.md")

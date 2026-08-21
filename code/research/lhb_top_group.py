@@ -1,6 +1,9 @@
 """龙虎榜净买额 Top-N 事件分组的分年稳定性验证"""
+import os
 import sys
-sys.path.insert(0, r"D:/quant_project/code")
+from pathlib import Path
+PROJ = Path(os.environ.get("QUANT_PROJECT", r"D:/quant_project"))
+sys.path.insert(0, str(PROJ / "code"))
 import polars as pl
 
 lhb = pl.read_parquet(r"D:/quant_data/lhb_hist.parquet").with_columns(pl.col("日期").str.to_date())

@@ -2,8 +2,11 @@
 """短线三条件因子 L1 体检（阶段6）——放量/站上10日线/近5日涨停
 在 ic_data 设计段(2021-2023) 算 IC/ICIR/t_NW + Top5毛收益, 与成本线0.45%比
 """
+import os
 import sys
-sys.path.insert(0, r"D:/quant_project/code")
+from pathlib import Path
+PROJ = Path(os.environ.get("QUANT_PROJECT", r"D:/quant_project"))
+sys.path.insert(0, str(PROJ / "code"))
 import polars as pl
 import numpy as np
 from loop.factor_loop_l1l2 import newey_west_t

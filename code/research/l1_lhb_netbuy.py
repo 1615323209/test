@@ -4,8 +4,11 @@
   因子B: lhb_netbuy_z 事件内强度带符号 z-score(未上榜=0, 0落在上榜股中位附近=真中性)
 P0-3: ICIR 用经典公式(不乘sqrtN)
 """
+import os
 import sys
-sys.path.insert(0, r"D:/quant_project/code")
+from pathlib import Path
+PROJ = Path(os.environ.get("QUANT_PROJECT", r"D:/quant_project"))
+sys.path.insert(0, str(PROJ / "code"))
 import polars as pl
 import numpy as np
 from loop.factor_loop_l1l2 import newey_west_t
@@ -51,12 +54,17 @@ def l1_check(label, factor_df, col):
     icir_ann = icir * np.sqrt(252)
     t = newey_west_t(ics)
     print(f"IC={icm:+.4f} ICIR={icir:+.3f} ICIR_ann={icir_ann:+.3f} t_NW={t:+.2f} N={len(ics)}天")
-    # 分组均值(因子值分组)
-    g = d.group_by(col).agg(pl.col("fwd_5d").mean().alias("ret"), pl.len().alias("n")).sort(col)
-    desc = []
-    for r in g.to_dicts():
-        desc.append((round(r[col], 2), f"{r['ret']*100:+.2f}%", r["n"]))
-    print(f"因子值分布: {desc[:8]}")
+    # D3(v4.2): 连续因子分位数分桶(10档), 单调性可读; 离散因子保留分组均值
+    if d[col].n_unique() > 50:
+        dd = d.with_columns(pl.col(col).qcut(10, labels=[str(i) for i in range(10)],
+                                             allow_duplicates=True).alias("_bkt"))
+        g = dd.group_by("_bkt").agg(pl.col("fwd_5d").mean().alias("ret"), pl.len().alias("n")).sort("_bkt")
+        desc = [(str(r["_bkt"]), f"{r['ret']*100:+.2f}%", r["n"]) for r in g.to_dicts()]
+        print(f"分位桶(0低→9高): {desc}")
+    else:
+        g = d.group_by(col).agg(pl.col("fwd_5d").mean().alias("ret"), pl.len().alias("n")).sort(col)
+        desc = [(round(r[col], 2), f"{r['ret']*100:+.2f}%", r["n"]) for r in g.to_dicts()]
+        print(f"因子值分布: {desc[:8]}")
 
 
 l1_check("A_lhb_event(上榜哑变量)", fa, "lhb_event")
