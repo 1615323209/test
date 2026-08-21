@@ -86,7 +86,11 @@ def slippage(ret_1d):
     return 0.001 + 0.002 * vol_factor
 
 def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=True,
-                 return_by_year=False, include_base=True):
+                 return_by_year=False, include_base=True,
+                 exit_mode="v7",      # B1(v4.2): "v7" | "hold_n" 持满N日退出
+                 hold_days=5,         # B1: exit_mode="hold_n" 时持有的交易日数
+                 market_gate=True,    # B1: False 关闭 market_ok 择时门
+                 trend_filter=True):  # B1: False 关闭 收盘>ma_20 与 price_pos_20 区间
     """
     extra_factors: dict {name: (polars_expr_str, weight)}
         polars_expr_str 需是 Expr 代码字符串，如 "(pl.col('ret_5d')*pl.col('turn_ma5')).rank().over('日期')"
@@ -142,6 +146,7 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
     if cov < 0.95:
         raise ValueError(f"A1 覆盖率仅 {cov:.1%}，低于 95% 阈值，结论不可信；先补采 raw_close")
     chunk_dates = sorted(chunk['日期'].unique().to_list())
+    DIDX = {d: i for i, d in enumerate(chunk_dates)}  # C1(v4.2): 全局交易日序号(跨chunk不崩, O(1))
 
     def compute_score(df):
         exprs = []
@@ -180,7 +185,7 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
             today_data = sub.filter(pl.col('日期') == today)
             for h in holdings[:]:
                 # P1-3: 时间止损用交易日序号计数(原自然日, 跨周末仅2-3交易日, 换手虚高)
-                held = sub_dates.index(today) - sub_dates.index(h['buy_date'])
+                held = DIDX[today] - DIDX[h['buy_date']]  # C1(v4.2): 全局索引, 跨chunk不抛ValueError
                 if held < 1: continue
                 row_data = today_data.filter(pl.col('股票代码') == h['code'])
                 if len(row_data) == 0: continue
@@ -192,14 +197,18 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
                 pnl = (close-cost)/cost
                 peak = h.get('peak', cost); h['peak'] = max(peak, close)
                 reason = None; sell_pct = 1.0
-                if pnl <= STOP_LOSS: reason = '止损'
-                elif pnl >= TP: reason = '止盈'
-                elif h['peak'] >= cost*(1+PROTECT_GAIN) and pnl < 0.01: reason = '保本'
-                elif row['ma_60'] is not None and close < row['ma_60']: reason = '破MA60'
-                elif row['ma_20'] is not None and close < row['ma_20']:
-                    if not h.get('half_sold'): reason, sell_pct = '破MA20减半', 0.5
-                    else: reason = '破MA20清仓'
-                elif held >= TIME_STOP_DAYS and pnl < TIME_STOP_GAIN: reason = '时间止损'
+                # B1(v4.2): 退出规则开关——hold_n 模式只按持满N日退出(隔离止损/止盈/MA规则的影响)
+                if exit_mode == "hold_n":
+                    if held >= hold_days: reason = f'持满{hold_days}日'
+                else:
+                    if pnl <= STOP_LOSS: reason = '止损'
+                    elif pnl >= TP: reason = '止盈'
+                    elif h['peak'] >= cost*(1+PROTECT_GAIN) and pnl < 0.01: reason = '保本'
+                    elif row['ma_60'] is not None and close < row['ma_60']: reason = '破MA60'
+                    elif row['ma_20'] is not None and close < row['ma_20']:
+                        if not h.get('half_sold'): reason, sell_pct = '破MA20减半', 0.5
+                        else: reason = '破MA20清仓'
+                    elif held >= TIME_STOP_DAYS and pnl < TIME_STOP_GAIN: reason = '时间止损'
                 if reason:
                     slip = slippage(ret1d)
                     sell_price = close*(1-slip)
@@ -207,35 +216,42 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
                     sell_shares = int(h['shares']*sell_pct)
                     if sell_shares < 100: sell_shares = h['shares']
                     sell_amt = sell_shares*sell_price_cash
-                    fee = max(COMM_MIN, sell_amt*COMM_RATE) + sell_amt*STAMP_RATE
+                    sell_fee = max(COMM_MIN, sell_amt*COMM_RATE) + sell_amt*STAMP_RATE
+                    buy_fee_alloc = h.get('buy_fee', 0) * (sell_shares / h['shares0'])  # A1(v4.2): 摊买入佣金
+                    fee = sell_fee + buy_fee_alloc
                     # P1-2: 损益金额与收益率同源——用复权收益率(含分红), 不再用不复权价差(把分红当亏损)
                     hfq_ret = (sell_price / h['buy_price']) - 1
                     gross = sell_shares * h.get('cost_per_share', sell_price) * hfq_ret
                     profit = gross - fee
-                    # 校验(复核P1-2): 金额与率可互校 abs(pnl - pnl_pct/100*shares*cost_per_share) < fee+0.01
-                    assert abs(profit - (hfq_ret * sell_shares * h.get('cost_per_share', sell_price))) < fee + 0.01, \
-                        f"损益不可互校 {h['code']}"
+                    # B0(v4.2): 三层收益——纯价格(对账网格fwd_5d) / 含滑点(复权) / 含费用(净)
+                    px_ret = (close / h['buy_close_hfq']) - 1
+                    notional = sell_shares * h.get('cost_per_share', sell_price)
+                    net_ret = hfq_ret - fee / notional if notional > 0 else 0
                     all_trades.append({
                         'code': h['code'], 'buy_date': h['buy_date'],
                         'buy_price': cost, 'sell_date': today,
                         'sell_price': sell_price, 'shares': sell_shares,
                         'pnl': profit, 'pnl_pct': hfq_ret*100, 'fee': fee,
+                        'px_ret_pct': px_ret*100, 'hfq_ret_pct': hfq_ret*100,
+                        'net_ret_pct': net_ret*100, 'notional': notional,
                         'reason': reason, 'held_days': held,
                         'price_src': h.get('price_src', 'raw')
                     })
-                    cash += sell_amt - fee
+                    cash += sell_amt - sell_fee
                     h['shares'] -= sell_shares
                     if sell_pct == 0.5: h['half_sold'] = True
                     if h['shares'] < 100: holdings.remove(h)
-            if not market_ok(today): continue
+            if market_gate and not market_ok(today): continue  # B1(v4.2): 择时门开关
             if len(holdings) < N_SLOTS and cash >= MIN_CASH:
                 held_codes = {h['code'] for h in holdings}
                 candidates = today_data.filter(~pl.col('股票代码').is_in(held_codes))
-                candidates = candidates.filter(
-                    (pl.col('is_suspended')==0) & (pl.col('limit_up')==0) & (pl.col('limit_down')==0)
-                    & (pl.col('price_pos_20')<0.85) & (pl.col('price_pos_20')>0.1)
-                    & (pl.col('收盘')>pl.col('ma_20'))
-                )
+                cand_f = ((pl.col('is_suspended')==0) & (pl.col('limit_up')==0) & (pl.col('limit_down')==0))
+                # B1(v4.2): 动量筛开关——关闭后只剩可交易性过滤(与网格口径对齐)
+                if trend_filter:
+                    cand_f = (cand_f & (pl.col('price_pos_20')<0.85)
+                              & (pl.col('price_pos_20')>0.1)
+                              & (pl.col('收盘')>pl.col('ma_20')))
+                candidates = candidates.filter(cand_f)
                 if len(candidates) > 0:
                     scored = compute_score(candidates)
                     top = scored.sort('score', descending=True).head(TOP_N)
@@ -248,17 +264,17 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
                         buy_price = float(row['收盘'])*(1+slip)
                         shares = int(POSITION/raw_price/100)*100
                         if shares < 100: continue
-                        # P0-5: 仓位断言(上限不超仓; 下限0.5容忍A股一手100股离散:
-                        # 价位>25元的票5000仓只能买1手(如29.94元→100股=2994仅60%))
-                        assert POSITION*0.5 <= shares*raw_price <= POSITION, \
-                            f"仓位异常 {code}: {shares}股 × {raw_price} = {shares*raw_price}"
+                        # C3(v4.2): 仓位断言已删(数学上恒真, 无校验价值), 改为末尾统计仓位利用率
                         # P1-1: 买入滑点计入现金流(复核: 原cash_cost不含滑点, 每笔少算0.1-0.3%)
                         cash_cost = shares * raw_price * (1 + slip)
                         fee = max(COMM_MIN, cash_cost*COMM_RATE)
                         if cash_cost+fee > cash: continue
                         cash -= cash_cost+fee
                         holdings.append({'code':code,'buy_date':today,'buy_price':buy_price,
-                                         'shares':shares,'peak':buy_price,'half_sold':False,
+                                         'shares':shares,'shares0':shares,      # A1(v4.2): 原始股数(摊佣金用)
+                                         'buy_fee':fee,                          # A1(v4.2): 买入佣金(进pnl)
+                                         'buy_close_hfq':float(row['收盘']),     # B0(v4.2): 买入日复权收盘(对账网格)
+                                         'peak':buy_price,'half_sold':False,
                                          'cost_per_share':raw_price*(1+slip),  # A1: 实盘每股成本(含滑点)
                                          'price_src':price_src})  # P0-5: 记录价格口径
         del sub; gc.collect()
@@ -277,20 +293,28 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
                 sell_price = close*(1-slip)
                 sell_price_cash = raw_close*(1-slip)
                 sell_amt = h['shares']*sell_price_cash
-                fee = max(COMM_MIN, sell_amt*COMM_RATE) + sell_amt*STAMP_RATE
+                sell_fee = max(COMM_MIN, sell_amt*COMM_RATE) + sell_amt*STAMP_RATE
+                buy_fee_alloc = h.get('buy_fee', 0) * (h['shares'] / h['shares0'])  # A1: 摊买入佣金
+                fee = sell_fee + buy_fee_alloc
                 # P1-2: 强制平仓也统一用复权收益率(含分红)口径
                 hfq_ret = (sell_price - h['buy_price']) / h['buy_price']
                 profit = h['shares']*h.get('cost_per_share', h['buy_price'])*hfq_ret - fee
+                # B0: 三层收益
+                px_ret = (close / h.get('buy_close_hfq', h['buy_price'])) - 1
+                notional = h['shares'] * h.get('cost_per_share', h['buy_price'])
+                net_ret = hfq_ret - fee / notional if notional > 0 else 0
                 all_trades.append({
                     'code': h['code'], 'buy_date': h['buy_date'],
                     'buy_price': h['buy_price'], 'sell_date': last,
                     'sell_price': sell_price, 'shares': h['shares'],
                     'pnl': profit, 'pnl_pct': hfq_ret*100,
+                    'px_ret_pct': px_ret*100, 'hfq_ret_pct': hfq_ret*100,
+                    'net_ret_pct': net_ret*100, 'notional': notional,
                     'fee': fee, 'reason': '强制平仓',
-                    'held_days': (last-h['buy_date']).days,
+                    'held_days': DIDX[last] - DIDX[h['buy_date']],  # C1: 交易日计数
                     'price_src': h.get('price_src', 'raw')
                 })
-                cash += sell_amt - fee
+                cash += sell_amt - sell_fee
 
     trades = pd.DataFrame(all_trades)
     if len(trades) == 0:
@@ -313,6 +337,29 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
             "n_trades": len(trades), "win_rate": round(win_rate, 1),
             "pl_ratio": round(pl_ratio, 2) if pl_ratio != float('inf') else 99,
             "max_dd_pct": round(dd_pct, 2), "fee_total": round(total_fee, 0)}
+    # B0(v4.2): 每笔毛/净收益率(与网格对账桥梁) + 平均持仓
+    if "px_ret_pct" in trades.columns:
+        out["avg_px_ret_pct"] = round(float(trades['px_ret_pct'].mean()), 4)
+        out["avg_hfq_ret_pct"] = round(float(trades['hfq_ret_pct'].mean()), 4)
+        out["avg_net_ret_pct"] = round(float(trades['net_ret_pct'].mean()), 4)
+        out["avg_held_days"] = round(float(trades['held_days'].mean()), 2)
+    # C2(v4.2): 现金账 vs 损益账对账(差=分红; >15% 告警)
+    final_equity = cash  # 此时 holdings 已全部强平
+    cash_pnl = final_equity - INIT_CAPITAL
+    book_pnl = float(trades['pnl'].sum())
+    div_gap = book_pnl - cash_pnl
+    out["cash_pnl"] = round(cash_pnl, 0)
+    out["book_pnl"] = round(book_pnl, 0)
+    out["div_gap_pct"] = round(div_gap / INIT_CAPITAL * 100, 2)
+    if abs(div_gap) / INIT_CAPITAL > 0.15:
+        print(f"  ⚠️ 两账差 {div_gap:+.0f} 元 ({div_gap/INIT_CAPITAL:+.1%})，超出分红可解释范围，请查账")
+    # C3(v4.2): 用 trade 记录字段独立重算 pnl 校验
+    recomputed = trades['notional'] * trades['hfq_ret_pct'] / 100 - trades['fee']
+    max_err = float((recomputed - trades['pnl']).abs().max())
+    assert max_err < 0.01, f"损益重算不一致, 最大偏差 {max_err:.4f} 元"
+    # C3(v4.2): 仓位利用率统计
+    util = trades['notional'] / POSITION
+    print(f"  [仓位利用率] 均值 {util.mean():.1%}, P10 {util.quantile(0.1):.1%}, 最低 {util.min():.1%}")
     if return_by_year:
         # 改造 C22：按卖出年份聚合收益（供分段披露），不再另跑独立分段回测
         ts["年份"] = pd.to_datetime(ts["sell_date"]).dt.year
