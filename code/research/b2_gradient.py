@@ -23,10 +23,11 @@ NEW4 = {
 }
 TURN = {"turn_ratio": ("(-pl.col('turn_ratio'))", 1.0)}
 
-def run(tag, factors, exit_mode="v7", market_gate=True, trend_filter=True):
+def run(tag, factors, exit_mode="v7", market_gate=True, trend_filter=True, hold_days=5):
     m = run_backtest(extra_factors=factors, start_year=2021, end_year=2026,
                      verbose=False, include_base=False,
-                     exit_mode=exit_mode, market_gate=market_gate, trend_filter=trend_filter)
+                     exit_mode=exit_mode, hold_days=hold_days,
+                     market_gate=market_gate, trend_filter=trend_filter)
     print(f"{tag}: px={m.get('avg_px_ret_pct',0):+.3f}% net={m.get('avg_net_ret_pct',0):+.3f}% "
           f"n={m['n_trades']} ret={m['total_ret_pct']:+.1f}%")
     return m

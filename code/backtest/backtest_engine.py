@@ -215,24 +215,22 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
                     sell_price_cash = raw_close*(1-slip)  # A1: 实盘卖出价(现金口径)
                     sell_shares = int(h['shares']*sell_pct)
                     if sell_shares < 100: sell_shares = h['shares']
-                    sell_amt = sell_shares*sell_price_cash
+                    # C2(v4.2最终): 卖出金额/损益全用复权价(与买入段同口径, 无除权假亏)
+                    sell_amt = sell_shares * sell_price
                     sell_fee = max(COMM_MIN, sell_amt*COMM_RATE) + sell_amt*STAMP_RATE
                     buy_fee_alloc = h.get('buy_fee', 0) * (sell_shares / h['shares0'])  # A1(v4.2): 摊买入佣金
                     fee = sell_fee + buy_fee_alloc
-                    # C2(v4.2): 损益用现金口径(不复权价差)——与现金账一致, 分红不虚拟计入
-                    # (复权收益率含分红, 与现金账天然差一个分红; 回测无分红现金流, 以现金口径为准)
-                    cash_ret = (sell_price_cash / h['cost_per_share']) - 1
-                    profit = sell_shares * h['cost_per_share'] * cash_ret - fee
-                    # B0(v4.2): 三层收益——纯价格(对账网格fwd_5d) / 含滑点(复权) / 含费用(净, 现金口径)
+                    hfq_ret = (sell_price / h['buy_price']) - 1  # 复权收益率(真实收益含分红)
+                    profit = sell_shares * h['cost_per_share'] * hfq_ret - fee
+                    # B0(v4.2): 三层收益——纯价格(对账网格fwd_5d) / 含滑点(复权) / 含费用(净, 复权口径)
                     px_ret = (close / h['buy_close_hfq']) - 1
-                    hfq_ret = (sell_price / h['buy_price']) - 1
-                    notional = sell_shares * h.get('cost_per_share', sell_price)
-                    net_ret = cash_ret - fee / notional if notional > 0 else 0
+                    notional = sell_shares * h['cost_per_share']
+                    net_ret = hfq_ret - fee / notional if notional > 0 else 0
                     all_trades.append({
                         'code': h['code'], 'buy_date': h['buy_date'],
                         'buy_price': cost, 'sell_date': today,
                         'sell_price': sell_price, 'shares': sell_shares,
-                        'pnl': profit, 'pnl_pct': cash_ret*100, 'fee': fee,
+                        'pnl': profit, 'pnl_pct': hfq_ret*100, 'fee': fee,
                         'px_ret_pct': px_ret*100, 'hfq_ret_pct': hfq_ret*100,
                         'net_ret_pct': net_ret*100, 'notional': notional,
                         'reason': reason, 'held_days': held,
@@ -259,15 +257,15 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
                     for row in top.iter_rows(named=True):
                         code = row['股票代码']
                         slip = slippage(row['ret_1d'])
-                        # A1/A2: 股数与现金流用实盘价(不复权); 持仓盈亏判定仍用复权价(序列一致)
+                        # A1/A2: 股数用实盘价(不复权, 买得起多少); 持仓盈亏/金额用复权价(真实收益含分红)
                         raw_price = float(row.get('收盘_不复权') or row['收盘'])
                         price_src = 'raw' if row.get('收盘_不复权') is not None else 'hfq_fallback'
                         buy_price = float(row['收盘'])*(1+slip)
                         shares = int(POSITION/raw_price/100)*100
                         if shares < 100: continue
-                        # C3(v4.2): 仓位断言已删(数学上恒真, 无校验价值), 改为末尾统计仓位利用率
-                        # P1-1: 买入滑点计入现金流(复核: 原cash_cost不含滑点, 每笔少算0.1-0.3%)
-                        cash_cost = shares * raw_price * (1 + slip)
+                        # C2(v4.2最终): 金额/损益全用复权价(与卖出同口径, 无除权假亏)
+                        # 买入金额用复权价(与损益同口径)
+                        cash_cost = shares * buy_price
                         fee = max(COMM_MIN, cash_cost*COMM_RATE)
                         if cash_cost+fee > cash: continue
                         cash -= cash_cost+fee
@@ -276,7 +274,7 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
                                          'buy_fee':fee,                          # A1(v4.2): 买入佣金(进pnl)
                                          'buy_close_hfq':float(row['收盘']),     # B0(v4.2): 买入日复权收盘(对账网格)
                                          'peak':buy_price,'half_sold':False,
-                                         'cost_per_share':raw_price*(1+slip),  # C2(v4.2): 每股成本用不复权实盘价(现金口径)
+                                         'cost_per_share':buy_price,  # C2最终: 复权每股成本(真实收益口径)
                                          'price_src':price_src})  # P0-5: 记录价格口径
         del sub; gc.collect()
         if verbose: print(f"  [诊断] cash={cash:.0f}, 持仓={len(holdings)}, 交易={len(all_trades)}")
@@ -292,24 +290,22 @@ def run_backtest(extra_factors=None, start_year=2021, end_year=2026, verbose=Tru
                 raw_close = float(row.get('收盘_不复权') or close)  # A1: 实盘价
                 slip = slippage(ret1d)
                 sell_price = close*(1-slip)
-                sell_price_cash = raw_close*(1-slip)
-                sell_amt = h['shares']*sell_price_cash
+                # C2(v4.2最终): 强制平仓同复权口径
+                sell_amt = h['shares'] * sell_price
                 sell_fee = max(COMM_MIN, sell_amt*COMM_RATE) + sell_amt*STAMP_RATE
                 buy_fee_alloc = h.get('buy_fee', 0) * (h['shares'] / h['shares0'])  # A1: 摊买入佣金
                 fee = sell_fee + buy_fee_alloc
-                # C2(v4.2): 强制平仓同现金口径(不复权价差)
-                cash_ret = (sell_price_cash / h['cost_per_share']) - 1
-                profit = h['shares'] * h['cost_per_share'] * cash_ret - fee
+                hfq_ret = (sell_price - h['buy_price']) / h['buy_price']
+                profit = h['shares'] * h['cost_per_share'] * hfq_ret - fee
                 # B0: 三层收益
                 px_ret = (close / h.get('buy_close_hfq', h['buy_price'])) - 1
-                hfq_ret = (sell_price - h['buy_price']) / h['buy_price']
-                notional = h['shares'] * h.get('cost_per_share', h['buy_price'])
-                net_ret = cash_ret - fee / notional if notional > 0 else 0
+                notional = h['shares'] * h['cost_per_share']
+                net_ret = hfq_ret - fee / notional if notional > 0 else 0
                 all_trades.append({
                     'code': h['code'], 'buy_date': h['buy_date'],
                     'buy_price': h['buy_price'], 'sell_date': last,
                     'sell_price': sell_price, 'shares': h['shares'],
-                    'pnl': profit, 'pnl_pct': cash_ret*100,
+                    'pnl': profit, 'pnl_pct': hfq_ret*100,
                     'px_ret_pct': px_ret*100, 'hfq_ret_pct': hfq_ret*100,
                     'net_ret_pct': net_ret*100, 'notional': notional,
                     'fee': fee, 'reason': '强制平仓',
