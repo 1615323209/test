@@ -15,10 +15,12 @@ DATA = Path("D:/quant_data")
 STATE = DATA / "live_positions.json"
 TRADES = DATA / "live_trades.csv"
 
-MAX_POSITIONS = 2
-MAX_AMOUNT = 10000.0
-STOP_LOSS = -0.05
-TAKE_PROFIT = 0.12
+# 流程改造3.0（2026-08-20用户决策）: 5日持仓 + 4仓×5000 + 止损-4% 止盈+6%
+MAX_POSITIONS = 4
+MAX_AMOUNT = 5000.0
+STOP_LOSS = -0.04
+TAKE_PROFIT = 0.06
+TIME_STOP_DAYS = 5  # 5交易日时间止损
 
 def load():
     if STATE.exists():
